@@ -1,0 +1,15 @@
+{
+  "model_type": "IsolationForest",
+  "version": "1.0.0",
+  "features": [
+    "ph",
+    "turbidity",
+    "ph_voltage",
+    "turbidity_voltage"
+  ],
+  "trained_at": "2026-11-06T16:58:44.729000",
+  "sample_count": 200,
+  "contamination": 0.08,
+  "trained_on_synthetic_data": true,
+  "validation_note": "Trained on controlled baseline. Real-world validation pending live sensor telemetry."
+}

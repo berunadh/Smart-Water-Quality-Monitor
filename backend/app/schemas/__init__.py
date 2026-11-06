@@ -4,6 +4,7 @@ from .sensor import (
     SensorReadingResponse,
     SensorStatsResponse,
     SystemHealthResponse,
+    SensorCalibrationStatus,
 )
 from .alert import AlertCreate, AlertResponse, AlertSummaryResponse
 from .thingspeak import (
@@ -12,6 +13,8 @@ from .thingspeak import (
     ThingSpeakFeedResponse,
     ThingSpeakSyncResult,
 )
+from .ml import AnomalyItem, AnomalyResponse, TrendItem, TrendResponse, MLSummaryResponse
+from .chat import ChatRequest, ChatResponse
 
 __all__ = [
     "SensorReadingBase",
@@ -19,6 +22,7 @@ __all__ = [
     "SensorReadingResponse",
     "SensorStatsResponse",
     "SystemHealthResponse",
+    "SensorCalibrationStatus",
     "AlertCreate",
     "AlertResponse",
     "AlertSummaryResponse",
@@ -26,4 +30,11 @@ __all__ = [
     "ThingSpeakChannelMeta",
     "ThingSpeakFeedResponse",
     "ThingSpeakSyncResult",
+    "AnomalyItem",
+    "AnomalyResponse",
+    "TrendItem",
+    "TrendResponse",
+    "MLSummaryResponse",
+    "ChatRequest",
+    "ChatResponse",
 ]

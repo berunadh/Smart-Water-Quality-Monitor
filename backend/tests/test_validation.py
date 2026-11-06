@@ -5,7 +5,7 @@ from app.services.validation_service import ValidationService
 
 
 def test_valid_reading():
-    is_valid, notes = ValidationService.validate_reading(
+    is_valid, is_stale, notes = ValidationService.validate_reading(
         ph=7.35,
         turbidity=1.5,
         tds=None,
@@ -20,7 +20,7 @@ def test_valid_reading():
 def test_adc_over_range_hazard():
     # If board voltage is 7.835V (previous concerning software log):
     # 7.835 * 0.40 = 3.134V ADC -> Exceeds 3.05V safety limit!
-    is_valid, notes = ValidationService.validate_reading(
+    is_valid, is_stale, notes = ValidationService.validate_reading(
         ph=7.0,
         turbidity=1.0,
         tds=None,
@@ -34,7 +34,7 @@ def test_adc_over_range_hazard():
 
 
 def test_implausible_ph():
-    is_valid, notes = ValidationService.validate_reading(
+    is_valid, is_stale, notes = ValidationService.validate_reading(
         ph=15.2,  # Physical bounds 0 to 14
         turbidity=2.0,
         tds=None,
@@ -47,7 +47,7 @@ def test_implausible_ph():
 
 
 def test_implausible_turbidity():
-    is_valid, notes = ValidationService.validate_reading(
+    is_valid, is_stale, notes = ValidationService.validate_reading(
         ph=7.2,
         turbidity=-3.0,  # Negative NTU is physically impossible
         tds=None,
@@ -61,14 +61,14 @@ def test_implausible_turbidity():
 
 def test_missing_tds_vs_zero_tds():
     # Correct case: TDS is None (absent)
-    is_valid_none, notes_none = ValidationService.validate_reading(
+    is_valid_none, _, notes_none = ValidationService.validate_reading(
         ph=7.0, turbidity=1.0, tds=None, ph_board_v=2.5, turbidity_board_v=4.0, health_code=0
     )
     assert is_valid_none is True
     assert "WARNING" not in notes_none
 
     # Suspicious case: TDS is 0.0 (uninstalled sensor reported as 0)
-    is_valid_zero, notes_zero = ValidationService.validate_reading(
+    is_valid_zero, _, notes_zero = ValidationService.validate_reading(
         ph=7.0, turbidity=1.0, tds=0.0, ph_board_v=2.5, turbidity_board_v=4.0, health_code=0
     )
     assert is_valid_zero is True

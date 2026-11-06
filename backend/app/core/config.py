@@ -1,4 +1,4 @@
-"""Application settings and runtime environment configuration."""
+"""Application settings and runtime environment configuration for Phase 2."""
 
 import os
 from typing import Optional
@@ -7,17 +7,21 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Smart Apartment Water Quality Monitor"
-    VERSION: str = "1.0.0-phase1"
+    VERSION: str = "2.0.0-phase2"
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
+
+    # Operating Mode: "demo" (simulated realistic streams) or "real" (ThingSpeak cloud)
+    DATA_MODE: str = "demo"
+    DEVICE_ID: str = "esp32-water-monitor-01"
 
     # Database
     DATABASE_URL: str = "sqlite:///./water_quality.db"
 
-    # ThingSpeak Telemetry Settings (Phase 2 Ingestion)
+    # ThingSpeak Cloud Telemetry Settings
     THINGSPEAK_CHANNEL_ID: str = "0"
     THINGSPEAK_READ_API_KEY: Optional[str] = None
-    THINGSPEAK_FETCH_INTERVAL_SECONDS: int = 30
+    POLL_INTERVAL_SECONDS: int = 20
 
     # Sensor Guidelines (EPA / WHO Standards)
     THRESHOLD_PH_MIN: float = 6.5
@@ -30,12 +34,19 @@ class Settings(BaseSettings):
     VOLTAGE_DIVIDER_RATIO: float = 0.40
     VOLTAGE_RECONSTRUCT_FACTOR: float = 2.50
 
-    # AI Chatbot (Phase 2)
+    # Machine Learning Settings
+    ML_MODEL_DIR: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "ml", "models")
+    ML_CONTAMINATION_RATE: float = 0.05
+    ML_ZSCORE_THRESHOLD: float = 3.0
+
+    # AI Chatbot & LLM Settings
+    LLM_PROVIDER: str = "fallback"  # Options: "gemini", "openai", "fallback"
+    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
-    AI_MODEL_NAME: str = "gemini-2.5-flash"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "backend/.env"),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",

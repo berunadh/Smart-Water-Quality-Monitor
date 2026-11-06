@@ -1,10 +1,14 @@
-"""Tool definitions for LLM function calling and agentic reasoning."""
+"""Tool definitions for LLM context retrieval and water domain reasoning."""
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy import func
+
 from app.models.water_reading import WaterReadingModel
 from app.models.alert_log import AlertLogModel
 from app.core.config import settings
+from app.ml.trend_analyzer import TrendAnalyzer
 
 
 class WaterChatbotTools:
@@ -25,12 +29,55 @@ class WaterChatbotTools:
             "timestamp": latest.timestamp.isoformat(),
             "ph": latest.ph,
             "turbidity_ntu": latest.turbidity,
-            "tds_ppm": latest.tds,
+            "tds_ppm": latest.tds,  # strictly null if uninstalled
+            "ph_calibrated": latest.ph_calibrated,
+            "turbidity_calibrated": latest.turbidity_calibrated,
+            "tds_calibrated": latest.tds_calibrated,
             "alert_severity": latest.alert_severity,
+            "alert_message": latest.alert_messages,
+            "health_summary": latest.sensor_health_summary,
+            "health_code": f"0x{latest.health_code:04X}",
             "is_valid": latest.is_valid,
-            "validation_notes": latest.validation_notes,
-            "ph_board_voltage": latest.ph_board_voltage,
-            "turbidity_board_voltage": latest.turbidity_board_voltage,
+            "is_stale": latest.is_stale,
+            "data_source": latest.data_source,
+            "operating_mode": latest.operating_mode,
+            "ph_voltage": latest.ph_voltage,
+            "turbidity_voltage": latest.turbidity_voltage,
+        }
+
+    @staticmethod
+    def get_historical_metrics(db: Session, hours: int = 24) -> Dict[str, Any]:
+        """Calculates 24-hour summary statistics from SQLite."""
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        count = (
+            db.query(func.count(WaterReadingModel.id))
+            .filter(WaterReadingModel.timestamp >= cutoff)
+            .scalar() or 0
+        )
+
+        if count == 0:
+            return {"count": 0, "status": "NO_RECENT_DATA"}
+
+        stats = (
+            db.query(
+                func.avg(WaterReadingModel.ph),
+                func.min(WaterReadingModel.ph),
+                func.max(WaterReadingModel.ph),
+                func.avg(WaterReadingModel.turbidity),
+                func.max(WaterReadingModel.turbidity),
+            )
+            .filter(WaterReadingModel.timestamp >= cutoff, WaterReadingModel.is_valid == True)
+            .first()
+        )
+
+        return {
+            "timeframe_hours": hours,
+            "total_samples": count,
+            "ph_average": round(stats[0], 2) if stats and stats[0] is not None else None,
+            "ph_min": round(stats[1], 2) if stats and stats[1] is not None else None,
+            "ph_max": round(stats[2], 2) if stats and stats[2] is not None else None,
+            "turbidity_average": round(stats[3], 2) if stats and stats[3] is not None else None,
+            "turbidity_max": round(stats[4], 2) if stats and stats[4] is not None else None,
         }
 
     @staticmethod
@@ -62,21 +109,23 @@ class WaterChatbotTools:
                 "parameter": "pH",
                 "safe_range": f"{settings.THRESHOLD_PH_MIN} to {settings.THRESHOLD_PH_MAX}",
                 "unit": "pH scale (0-14)",
-                "standards": "EPA Secondary Drinking Water Regulations / WHO Guidelines",
+                "standards": "EPA National Secondary Drinking Water Regulations (6.5 to 8.5)",
                 "health_implications": (
-                    "Low pH (<6.5) can cause pipe corrosion and heavy metal leaching. "
-                    "High pH (>8.5) imparts a bitter taste and scale formation."
+                    "Water with a low pH (<6.5) is acidic, soft, and corrosive, which can leach toxic "
+                    "metal ions (lead, copper) from residential apartment plumbing fixtures. "
+                    "Water with high pH (>8.5) is alkaline, producing bitter taste and mineral scale incrustation."
                 ),
             }
-        elif "turb" in param:
+        elif "turb" in param or "cloud" in param:
             return {
                 "parameter": "Turbidity",
                 "safe_limit": f"Below {settings.THRESHOLD_TURBIDITY_NTU_MAX} NTU",
                 "unit": "Nephelometric Turbidity Units (NTU)",
-                "standards": "WHO Drinking Water Guidelines (<5.0 NTU; ideally <1.0 NTU for disinfection)",
+                "standards": "WHO Drinking Water Guidelines (<5.0 NTU; ideally <1.0 NTU)",
                 "health_implications": (
-                    "High turbidity indicates suspended organic/inorganic particles, rust from pipes, "
-                    "or microbial contamination which can harbor pathogens and shield them from disinfection."
+                    "Turbidity measures cloudiness caused by suspended colloids, clay, silt, or rust. "
+                    "While not a direct toxin, high turbidity shields pathogenic microorganisms from UV/chlorine "
+                    "disinfection and promotes bacterial regrowth in building storage tanks."
                 ),
             }
         elif "tds" in param:
@@ -86,8 +135,8 @@ class WaterChatbotTools:
                 "unit": "parts per million (ppm) / mg/L",
                 "standards": "EPA Secondary Standards (<500 ppm)",
                 "health_implications": (
-                    "High TDS produces hard water, mineral deposits, and altered taste. "
-                    "In this system, the TDS sensor is reserved for Phase 2 hardware installation."
+                    "Measures combined inorganic salts (calcium, magnesium, chlorides, sulfates). "
+                    "In this Phase 1/Phase 2 monitor, the TDS sensor is reserved for future hardware installation."
                 ),
             }
         else:

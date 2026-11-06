@@ -11,7 +11,7 @@
  * ============================================================================
  * CLOUD MANAGER (THINGSPEAK & WI-FI INTEGRATION)
  * ============================================================================
- * Prepares the ESP32 firmware for ThingSpeak telemetry ingestion in Phase 2.
+ * Full Phase 2 ThingSpeak REST API Integration for ESP32.
  * 
  * FIELD MAPPINGS:
  * - Field 1: Calibrated pH (omitted if uncalibrated or in error)
@@ -22,9 +22,13 @@
  * - Field 6: Turbidity Board Output Voltage (V_sensor = V_ADC * 2.50)
  * - Field 7: System Health Bitmask (16-bit integer)
  * 
- * Robustness:
- * Non-blocking Wi-Fi reconnect and HTTP client. If connection fails or drops,
- * local sensor monitoring and buzzer alerting continue without interruption.
+ * ROBUSTNESS & NON-BLOCKING ISOLATION:
+ * - Non-blocking Wi-Fi reconnect state machine.
+ * - Non-blocking transmission interval (20s >= 15s free limit).
+ * - Automatic retry with 5s backoff on network failure.
+ * - Tracks last successful upload timestamp and entry ID.
+ * - Independent execution: local sensor acquisition, OLED refresh,
+ *   and buzzer alerts continue completely uninterrupted if cloud fails.
  * ============================================================================
  */
 
@@ -32,10 +36,13 @@ class CloudManager {
 public:
     CloudManager()
         : _lastUploadMillis(0),
+          _lastSuccessMillis(0),
           _lastWifiCheckMillis(0),
           _lastHttpStatus(0),
+          _lastEntryId(0),
           _uploadCount(0),
           _failedUploads(0),
+          _retryPending(false),
           _cloudStatusText("INIT") {}
 
     void begin() {
@@ -59,12 +66,25 @@ public:
         return _cloudStatusText;
     }
 
+    uint32_t getLastSuccessMillis() const {
+        return _lastSuccessMillis;
+    }
+
+    long getLastEntryId() const {
+        return _lastEntryId;
+    }
+
+    uint32_t getSecondsSinceLastUpload(uint32_t currentMillis) const {
+        if (_lastSuccessMillis == 0) return 9999;
+        return (currentMillis - _lastSuccessMillis) / 1000;
+    }
+
     void update(uint32_t currentMillis,
                 const SensorReading& ph,
                 const SensorReading& turb,
                 const SensorReading& tds,
                 const SensorValidator& validator) {
-        // 1. Maintain Wi-Fi Connection (Checked every 5 seconds)
+        // 1. Maintain Wi-Fi Connection State (Non-blocking check every 5 seconds)
         if (currentMillis - _lastWifiCheckMillis >= 5000) {
             _lastWifiCheckMillis = currentMillis;
 
@@ -75,11 +95,11 @@ public:
 
             if (WiFi.status() != WL_CONNECTED) {
                 _cloudStatusText = "OFF";
-                // Non-blocking reconnect attempt if disconnected
+                // Attempt non-blocking reconnect every 10s if disconnected
                 static uint32_t lastReconnectAttempt = 0;
                 if (currentMillis - lastReconnectAttempt >= 10000) {
                     lastReconnectAttempt = currentMillis;
-                    Serial.println(F("[WIFI] Disconnected. Reconnecting..."));
+                    Serial.println(F("[WIFI] Disconnected. Reconnecting in background..."));
                     WiFi.disconnect();
                     WiFi.reconnect();
                 }
@@ -93,8 +113,10 @@ public:
             }
         }
 
-        // 2. Check ThingSpeak upload interval (20 seconds >= 15s rate limit)
-        if (currentMillis - _lastUploadMillis < THINGSPEAK_INTERVAL_MS) {
+        // 2. Timing Gate: Determine if it is time to upload
+        // If a retry is pending, wait 5s backoff; otherwise enforce THINGSPEAK_INTERVAL_MS (20s)
+        uint32_t requiredInterval = _retryPending ? 5000 : THINGSPEAK_INTERVAL_MS;
+        if (currentMillis - _lastUploadMillis < requiredInterval) {
             return;
         }
 
@@ -104,7 +126,7 @@ public:
 
         _lastUploadMillis = currentMillis;
 
-        // Verify valid API key before attempting upload
+        // Verify that Write API key is configured
         if (String(THINGSPEAK_WRITE_API_KEY) == "REPLACE_WITH_WRITE_KEY" || 
             String(THINGSPEAK_WRITE_API_KEY) == "YOUR_THINGSPEAK_WRITE_KEY") {
             _cloudStatusText = "NO_KEY";
@@ -113,32 +135,24 @@ public:
         }
 
         // 3. Construct Payload with strict contract rules
-        // Field 1: pH (omitted if uncalibrated/invalid)
-        // Field 2: Turbidity (omitted if uncalibrated/invalid)
-        // Field 3: TDS (omitted if unavailable, NEVER 0)
-        // Field 4: Alert Severity (0, 1, 2, 3)
-        // Field 5: pH Reconstructed Voltage
-        // Field 6: Turbidity Reconstructed Voltage
-        // Field 7: System Health Bitmask
-
         String postData = "api_key=" + String(THINGSPEAK_WRITE_API_KEY);
 
-        // Field 1: Calibrated pH
+        // Field 1: Calibrated pH (omitted if uncalibrated or in error)
         if (ph.isValid && !isnan(ph.calibratedValue)) {
             postData += "&field1=" + String(ph.calibratedValue, 2);
         }
 
-        // Field 2: Calibrated Turbidity
+        // Field 2: Calibrated Turbidity (omitted if uncalibrated or in error)
         if (turb.isValid && !isnan(turb.calibratedValue)) {
             postData += "&field2=" + String(turb.calibratedValue, 1);
         }
 
-        // Field 3: TDS (Omitted if sensor not installed; STRICT: never upload 0)
+        // Field 3: TDS (STRICT REQUIREMENT: Omitted / blank when uninstalled. NEVER send 0)
         if (tds.isValid && !isnan(tds.calibratedValue) && tds.status != STATUS_UNAVAILABLE) {
             postData += "&field3=" + String(tds.calibratedValue, 0);
         }
 
-        // Field 4: Severity code
+        // Field 4: Alert Severity code (0=Normal, 1=Warning, 2=Critical, 3=Fault)
         postData += "&field4=" + String((int)validator.getSeverity());
 
         // Field 5: pH signal board voltage (uncalibrated diagnostic)
@@ -147,14 +161,14 @@ public:
         // Field 6: Turbidity signal board voltage (uncalibrated diagnostic)
         postData += "&field6=" + String(turb.reconstructedVoltage, 3);
 
-        // Field 7: System Health Bitmask
+        // Field 7: System Health Bitmask (16-bit integer)
         postData += "&field7=" + String(validator.getHealthCode());
 
-        // 4. Transmit HTTP POST to ThingSpeak
+        // 4. Transmit HTTP POST to ThingSpeak API
         HTTPClient http;
         http.begin("http://api.thingspeak.com/update");
         http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-        http.setTimeout(4000); // 4-second timeout to prevent blocking
+        http.setTimeout(3500); // 3.5s timeout prevents blocking sensor loop
 
         _cloudStatusText = "TX...";
         int httpResponseCode = http.POST(postData);
@@ -162,22 +176,30 @@ public:
 
         if (httpResponseCode > 0) {
             String response = http.getString();
-            // ThingSpeak returns the newly created entry_id on success (>0), or 0 on rate limit
             long entryId = response.toInt();
             if (entryId > 0) {
+                // Successful update returns positive entry_id
                 _uploadCount++;
+                _lastEntryId = entryId;
+                _lastSuccessMillis = currentMillis;
+                _retryPending = false;
                 _cloudStatusText = "SYNC";
-                Serial.printf("[CLOUD] ThingSpeak upload successful! Entry ID: %ld (Total: %lu)\n", 
+                Serial.printf("[CLOUD] ThingSpeak upload SUCCESS! Entry #%ld (Total: %lu)\n", 
                               entryId, _uploadCount);
             } else {
+                // Return of "0" means rate limit (too frequent) or invalid API key
                 _failedUploads++;
+                _retryPending = false;
                 _cloudStatusText = "RATE";
-                Serial.printf("[CLOUD] ThingSpeak rate limit or rejected. Response: %s\n", response.c_str());
+                Serial.printf("[CLOUD] ThingSpeak rejected upload (Rate limit or invalid key). Response: %s\n", response.c_str());
             }
         } else {
+            // Network failure or timeout
             _failedUploads++;
-            _cloudStatusText = "ERR";
-            Serial.printf("[CLOUD] HTTP POST failed, error: %s\n", http.errorToString(httpResponseCode).c_str());
+            _cloudStatusText = "RETRY";
+            _retryPending = true;
+            Serial.printf("[CLOUD] HTTP POST failed: %s (will retry in 5s)\n", 
+                          http.errorToString(httpResponseCode).c_str());
         }
 
         http.end();
@@ -185,9 +207,12 @@ public:
 
 private:
     uint32_t _lastUploadMillis;
+    uint32_t _lastSuccessMillis;
     uint32_t _lastWifiCheckMillis;
     int _lastHttpStatus;
+    long _lastEntryId;
     uint32_t _uploadCount;
     uint32_t _failedUploads;
+    bool _retryPending;
     const char* _cloudStatusText;
 };
