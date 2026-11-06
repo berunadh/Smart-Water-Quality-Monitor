@@ -1,0 +1,59 @@
+# Operating System
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Secrets & Local Environment Configs
+firmware/water_monitor/secrets.h
+backend/.env
+*.env.local
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Linting
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Arduino / ESP32 build artifacts
+*.hex
+*.bin
+*.elf
+*.o
+*.a
+*.d
+build/
+.vscode/
+.idea/
