@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <math.h>
 #include "../config.h"
 
 /**
@@ -8,7 +9,8 @@
  * SENSOR BASE CLASS & DATA STRUCTURES
  * ============================================================================
  * Defines the common sensor acquisition contract, trimmed-mean filtering,
- * electrical boundary checks, and standardized reading payload.
+ * electrical boundary checks, stabilization sampling, and standardized
+ * reading payload.
  * ============================================================================
  */
 
@@ -41,6 +43,30 @@ public:
     virtual SensorReading read() = 0;
     virtual bool isAvailable() const = 0;
     virtual bool isCalibrated() const = 0;
+
+    /**
+     * Converts raw 12-bit ADC integer to volts (0.0 to 3.3V).
+     */
+    float rawToAdcVoltage(float raw) const {
+        return (raw / ESP32_ADC_MAX_RAW) * ESP32_ADC_VREF;
+    }
+
+    /**
+     * Reconstructs the voltage output of the sensor signal conditioning board
+     * based on the calibrated resistor divider ratio:
+     * V_sensor = V_ADC * ((R1 + R2) / R2)
+     */
+    float adcToReconstructedVoltage(float vAdc) const {
+        return vAdc * VOLTAGE_RECONSTRUCT_FACTOR;
+    }
+
+    /**
+     * Validates whether the voltage at the GPIO pin is within safe limits.
+     * Flags electrical hazard if ADC is saturating near 3.3V.
+     */
+    bool isOverRange(float raw, float vAdc) const {
+        return (raw >= ADC_OVER_RANGE_RAW || vAdc >= ADC_OVER_RANGE_VOLTS);
+    }
 
 protected:
     /**
@@ -84,26 +110,33 @@ protected:
     }
 
     /**
-     * Converts raw 12-bit ADC integer to volts (0.0 to 3.3V).
+     * Collects multiple oversampled readings over a stabilization window,
+     * calculating the average reconstructed board voltage and sample standard deviation.
+     * Used by calibration routines to verify measurement stability before acceptance.
      */
-    float rawToAdcVoltage(float raw) {
-        return (raw / ESP32_ADC_MAX_RAW) * ESP32_ADC_VREF;
-    }
+    bool sampleStableVoltage(uint8_t pin, uint8_t sampleCount, uint16_t delayMs, float& avgVoltage, float& stdDev) {
+        if (sampleCount < 5) sampleCount = 5;
+        if (sampleCount > 50) sampleCount = 50;
 
-    /**
-     * Reconstructs the voltage output of the sensor signal conditioning board
-     * based on the calibrated resistor divider ratio:
-     * V_sensor = V_ADC * ((R1 + R2) / R2)
-     */
-    float adcToReconstructedVoltage(float vAdc) {
-        return vAdc * VOLTAGE_RECONSTRUCT_FACTOR;
-    }
+        float voltages[50];
+        float sum = 0.0f;
 
-    /**
-     * Validates whether the voltage at the GPIO pin is within safe limits.
-     * Flags electrical hazard if ADC is saturating near 3.3V.
-     */
-    bool isOverRange(float raw, float vAdc) {
-        return (raw >= ADC_OVER_RANGE_RAW || vAdc >= ADC_OVER_RANGE_VOLTS);
+        for (uint8_t i = 0; i < sampleCount; i++) {
+            float raw = sampleAdcTrimmed(pin, 15, 2);
+            float vadc = rawToAdcVoltage(raw);
+            voltages[i] = adcToReconstructedVoltage(vadc);
+            sum += voltages[i];
+            if (delayMs > 0) delay(delayMs);
+        }
+
+        avgVoltage = sum / (float)sampleCount;
+
+        float varSum = 0.0f;
+        for (uint8_t i = 0; i < sampleCount; i++) {
+            float diff = voltages[i] - avgVoltage;
+            varSum += diff * diff;
+        }
+        stdDev = sqrt(varSum / (float)sampleCount);
+        return true;
     }
 };

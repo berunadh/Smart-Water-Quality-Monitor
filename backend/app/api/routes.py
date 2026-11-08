@@ -10,7 +10,15 @@ from app.database.session import get_db
 from app.core.config import settings
 from app.models.water_reading import WaterReadingModel
 from app.models.alert_log import AlertLogModel
-from app.schemas.sensor import SensorReadingResponse, SensorStatsResponse, SystemHealthResponse
+from app.models.calibration import CalibrationRecordModel
+from app.schemas.sensor import (
+    SensorReadingResponse,
+    SensorStatsResponse,
+    SystemHealthResponse,
+    CalibrationRecordCreate,
+    CalibrationRecordResponse,
+    CalibrationStatusDetail,
+)
 from app.schemas.alert import AlertResponse, AlertSummaryResponse
 from app.schemas.ml import AnomalyResponse, TrendResponse, MLSummaryResponse
 from app.schemas.chat import ChatRequest, ChatResponse, ChatbotStatusResponse
@@ -453,3 +461,79 @@ def inject_demo_scenario(scenario: str, db: Session = Depends(get_db)):
         db.commit()
 
     return reading
+
+
+# ==============================================================================
+# 8. SENSOR CALIBRATION MANAGEMENT
+# ==============================================================================
+
+@api_router.get("/calibration/status", response_model=CalibrationStatusDetail, tags=["Sensor Calibration"])
+def get_calibration_status(db: Session = Depends(get_db)):
+    """
+    Returns current calibration state of all probes, active raw voltages,
+    required reference standards, and recent logged calibration events.
+    """
+    latest = (
+        db.query(WaterReadingModel)
+        .order_by(WaterReadingModel.timestamp.desc())
+        .first()
+    )
+
+    records = (
+        db.query(CalibrationRecordModel)
+        .order_by(CalibrationRecordModel.timestamp.desc())
+        .limit(10)
+        .all()
+    )
+
+    ph_cal = latest.ph_calibrated if latest else False
+    turb_cal = latest.turbidity_calibrated if latest else False
+    tds_cal = latest.tds_calibrated if latest else False
+    ph_v = latest.ph_voltage if latest else 0.0
+    turb_v = latest.turbidity_voltage if latest else 0.0
+
+    return CalibrationStatusDetail(
+        ph_calibrated=ph_cal,
+        turbidity_calibrated=turb_cal,
+        tds_calibrated=tds_cal,
+        calibration_pending=(not ph_cal or not turb_cal),
+        ph_voltage=ph_v,
+        turbidity_voltage=turb_v,
+        ph_reference_standards=["pH 7.00 (Neutral Reference Buffer)", "pH 4.01 (Acidic Reference Buffer)"],
+        turbidity_reference_standards=["0.0 NTU (Distilled / Deionized Water Baseline)", "100.0 NTU (Certified Reference Standard)"],
+        recent_records=[CalibrationRecordResponse.model_validate(r) for r in records],
+    )
+
+
+@api_router.post("/calibration/record", response_model=CalibrationRecordResponse, tags=["Sensor Calibration"])
+def log_calibration_record(record_in: CalibrationRecordCreate, db: Session = Depends(get_db)):
+    """
+    Logs an official sensor calibration event into the database for compliance and traceability.
+    """
+    record = CalibrationRecordModel(
+        sensor_type=record_in.sensor_type,
+        point_name=record_in.point_name,
+        reference_value=record_in.reference_value,
+        measured_voltage=record_in.measured_voltage,
+        operator_notes=record_in.operator_notes,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@api_router.get("/calibration/records", response_model=List[CalibrationRecordResponse], tags=["Sensor Calibration"])
+def get_calibration_records(
+    sensor_type: Optional[str] = Query(None, description="Filter by 'ph', 'turbidity', or 'tds'"),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """
+    Retrieves historical calibration records.
+    """
+    query = db.query(CalibrationRecordModel)
+    if sensor_type:
+        query = query.filter(CalibrationRecordModel.sensor_type == sensor_type)
+    return query.order_by(CalibrationRecordModel.timestamp.desc()).limit(limit).all()
+

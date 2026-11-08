@@ -1,24 +1,39 @@
 #pragma once
 
+#include <Arduino.h>
+#include <Preferences.h>
 #include "SensorBase.h"
 
 /**
  * ============================================================================
  * TURBIDITY SENSOR DRIVER (OPTICAL PROBE + RED SIGNAL CONDITIONING BOARD)
  * ============================================================================
- * Pin: GPIO32 (ADC1_CH4)
+ * Pin: GPIO32 (ADC1_CH4 - Input Only)
  * Circuit: OUT pin -> 15kΩ -> GPIO32 -> 10kΩ -> GND
  * Reconstructed V_board = V_ADC * 2.500
  * 
  * Optical Characteristics:
- * - Clear water (0 NTU): Highest light transmission -> High voltage (~4.0 - 4.5V reconstructed)
- * - Turbid water (>50 NTU): Particle scattering blocks transmission -> Voltage drops
+ * - Clear water (0 NTU): Highest light transmission -> High voltage (typically 3.5 - 4.5V reconstructed)
+ * - Turbid water (>50 NTU): Particle scattering blocks transmission -> Voltage decreases monotonically
  * 
- * Calibration:
- * Generic quadratic curves vary drastically between probe manufacturing batches.
- * This driver supports two-point calibration using standard turbidity solutions
- * (0 NTU clean baseline and known NTU standard). Uncalibrated readings report
- * STATUS_CALIBRATION_PENDING while displaying electrical voltage honestly.
+ * Calibration Mathematics:
+ * - Two-Point Optical Attenuation Model:
+ *     Baseline Point: Distilled / Deionized water (0.0 NTU) -> V_clear
+ *     Standard Point: Certified Turbidity Standard (e.g. 100 NTU, 400 NTU) -> V_standard, NTU_standard
+ *     Validation: V_standard < V_clear (optical monotonicity) and (V_clear - V_standard) >= 0.15V
+ * 
+ * Conversion Equation:
+ *     ΔV = V_clear - V_meas
+ *     If ΔV <= 0: NTU = 0.0 (water is at or clearer than 0 NTU baseline)
+ *     Else: NTU = (ΔV / (V_clear - V_standard)) * NTU_standard
+ * 
+ * Physical Validation Rules:
+ * - V_clear must be >= 2.00V (clean optical path requires healthy phototransistor transmission)
+ * - V_clear strictly greater than V_standard
+ * - NTU_standard > 0.0 NTU
+ * - Measurement stability standard deviation σ < 0.05V
+ * - Never fabricates calibration constants; defaults to STATUS_CALIBRATION_PENDING
+ * - Persistent storage in ESP32 Flash NVS via Preferences API
  * ============================================================================
  */
 
@@ -35,6 +50,7 @@ public:
 
     void begin() override {
         pinMode(_pin, INPUT);
+        loadCalibration();
     }
 
     bool isAvailable() const override {
@@ -45,26 +61,126 @@ public:
         return _isCalibrated;
     }
 
+    float getVClear() const { return _vClear; }
+    float getVStandard() const { return _vStandard; }
+    float getNtuStandard() const { return _ntuStandard; }
+
     /**
-     * Calibrates turbidity response using clear distilled water (0 NTU)
-     * and a certified turbidity standard (e.g., 100 NTU or 400 NTU).
+     * Samples the probe stably over a series of readings and returns average voltage
+     * and standard deviation for calibration validation.
      */
-    void setCalibration(float vBoardClear, float vBoardStandard, float ntuStandard) {
-        if (vBoardClear <= vBoardStandard || ntuStandard <= 0.0f) {
-            // Optical sensor voltage MUST decrease with increasing turbidity
-            return;
+    bool acquireCalibrationReading(float& avgVoltage, float& stdDev) {
+        return sampleStableVoltage(_pin, 30, 80, avgVoltage, stdDev);
+    }
+
+    /**
+     * Sets two-point calibration using clear water (0 NTU) baseline and a known NTU standard.
+     * Enforces optical monotonicity (V_clear > V_standard).
+     */
+    bool setCalibration(float vBoardClear, float vBoardStandard, float ntuStandard, bool saveToNvs = true) {
+        // 1. Plausible clear water voltage (must be >= 2.0V reconstructed board voltage)
+        if (vBoardClear < 2.00f || vBoardClear > 5.00f) {
+            Serial.printf("[CAL] ERROR: Clear baseline voltage %.3fV is below minimum threshold (2.00V).\n", 
+                          vBoardClear);
+            Serial.println(F("[CAL] Check optical probe cleanliness, alignment, and wiring."));
+            return false;
         }
+
+        // 2. Optical monotonicity check: V_clear MUST be strictly greater than V_standard
+        if (vBoardStandard >= vBoardClear) {
+            Serial.printf("[CAL] ERROR: Optical inversion! Standard voltage (%.3fV) >= Clear baseline (%.3fV).\n", 
+                          vBoardStandard, vBoardClear);
+            Serial.println(F("[CAL] Optical turbidity sensors must exhibit decreasing voltage with increasing turbidity."));
+            return false;
+        }
+
+        // 3. Minimum voltage drop check (ΔV >= 0.15V)
+        float deltaV = vBoardClear - vBoardStandard;
+        if (deltaV < 0.15f) {
+            Serial.printf("[CAL] ERROR: Insufficient optical attenuation (|ΔV|=%.3fV < 0.15V).\n", deltaV);
+            return false;
+        }
+
+        // 4. Standard NTU must be positive and within reasonable limits
+        if (ntuStandard <= 0.0f || ntuStandard > 3000.0f) {
+            Serial.printf("[CAL] ERROR: Invalid standard NTU reference value (%.1f NTU).\n", ntuStandard);
+            return false;
+        }
+
         _vClear = vBoardClear;
         _vStandard = vBoardStandard;
         _ntuStandard = ntuStandard;
         _isCalibrated = true;
+
+        if (saveToNvs) {
+            saveCalibration();
+        }
+
+        return true;
     }
 
+    /**
+     * Safely resets calibration in memory and NVS back to uncalibrated pending state.
+     */
     void resetCalibration() {
         _isCalibrated = false;
         _vClear = 0.0f;
         _vStandard = 0.0f;
         _ntuStandard = 0.0f;
+
+        Preferences prefs;
+        if (prefs.begin("watersens", false)) {
+            prefs.remove("tb_cal");
+            prefs.remove("tb_vc");
+            prefs.remove("tb_vs");
+            prefs.remove("tb_ntu");
+            prefs.end();
+            Serial.println(F("[CAL] Turbidity calibration erased from NVS. Sensor reset to CALIBRATION_PENDING."));
+        }
+    }
+
+    /**
+     * Loads saved calibration coefficients from ESP32 non-volatile storage.
+     */
+    void loadCalibration() {
+        Preferences prefs;
+        if (prefs.begin("watersens", true)) { // Read-only mode
+            bool cal = prefs.getBool("tb_cal", false);
+            if (cal) {
+                float vc = prefs.getFloat("tb_vc", 0.0f);
+                float vs = prefs.getFloat("tb_vs", 0.0f);
+                float ntu = prefs.getFloat("tb_ntu", 0.0f);
+
+                if (vc >= 2.00f && vs < vc && (vc - vs) >= 0.15f && ntu > 0.0f) {
+                    _vClear = vc;
+                    _vStandard = vs;
+                    _ntuStandard = ntu;
+                    _isCalibrated = true;
+                    Serial.printf("[CAL] Loaded Turbidity calibration from NVS: V_clear=%.3fV, V_std=%.3fV (%0.1f NTU)\n",
+                                  _vClear, _vStandard, _ntuStandard);
+                } else {
+                    _isCalibrated = false;
+                }
+            } else {
+                _isCalibrated = false;
+            }
+            prefs.end();
+        }
+    }
+
+    /**
+     * Commits valid calibration parameters to ESP32 flash partition.
+     */
+    void saveCalibration() {
+        Preferences prefs;
+        if (prefs.begin("watersens", false)) { // Read-write mode
+            prefs.putBool("tb_cal", true);
+            prefs.putFloat("tb_vc", _vClear);
+            prefs.putFloat("tb_vs", _vStandard);
+            prefs.putFloat("tb_ntu", _ntuStandard);
+            prefs.end();
+            Serial.println(F("[CAL] Turbidity calibration successfully stored in persistent flash NVS."));
+        }
     }
 
     SensorReading read() override {
@@ -72,7 +188,7 @@ public:
         memset(&reading, 0, sizeof(reading));
         reading.calibratedValue = NAN;
 
-        // In Demo Mode, simulate clean municipal tap water (0.8 NTU, ~4.2V board, ~1.68V ADC)
+        // In Demo Mode, simulate clean municipal tap water (0.85 NTU, ~4.2V board, ~1.68V ADC)
         if (FEATURE_DEMO_MODE) {
             reading.rawAdc = 2085.0f + (float)(random(-10, 11));
             reading.adcVoltage = rawToAdcVoltage(reading.rawAdc);
@@ -123,7 +239,7 @@ public:
             _lastVoltage = reading.adcVoltage;
         }
 
-        // 5. Calibration check
+        // 5. Calibration check: If uncalibrated, electrical acquisition is valid, but value is strictly NaN
         if (!_isCalibrated) {
             reading.status = STATUS_CALIBRATION_PENDING;
             reading.isValid = true; // Signal board reading is electrically healthy
@@ -132,10 +248,12 @@ public:
             return reading;
         }
 
-        // 6. Compute calibrated turbidity (linear optical attenuation model)
-        // NTU = ( (V_clear - V_meas) / (V_clear - V_standard) ) * NTU_standard
+        // 6. Compute calibrated turbidity using optical attenuation model
+        // NTU = ((V_clear - V_meas) / (V_clear - V_standard)) * NTU_standard
         float deltaV = _vClear - reading.reconstructedVoltage;
-        if (deltaV < 0.0f) deltaV = 0.0f; // Cleaner than baseline clear water
+        if (deltaV < 0.0f) {
+            deltaV = 0.0f; // Cleaner than baseline clear water
+        }
         
         float ntu = (deltaV / (_vClear - _vStandard)) * _ntuStandard;
 

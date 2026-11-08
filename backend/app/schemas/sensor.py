@@ -145,3 +145,36 @@ class SystemHealthResponse(BaseModel):
             data_freshness=freshness,
             last_cloud_sync=last_sync,
         )
+
+
+class CalibrationRecordCreate(BaseModel):
+    sensor_type: str = Field(..., description="'ph', 'turbidity', or 'tds'")
+    point_name: str = Field(..., description="e.g. 'pH_7.00', 'pH_4.01', 'turb_0NTU', 'turb_100NTU'")
+    reference_value: float = Field(..., description="Known reference value (pH or NTU)")
+    measured_voltage: float = Field(..., ge=0.0, description="Measured board output voltage in V")
+    operator_notes: Optional[str] = None
+
+
+class CalibrationRecordResponse(BaseModel):
+    id: int
+    timestamp: datetime
+    sensor_type: str
+    point_name: str
+    reference_value: float
+    measured_voltage: float
+    operator_notes: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CalibrationStatusDetail(BaseModel):
+    ph_calibrated: bool
+    turbidity_calibrated: bool
+    tds_calibrated: bool
+    calibration_pending: bool
+    ph_voltage: float
+    turbidity_voltage: float
+    ph_reference_standards: List[str]
+    turbidity_reference_standards: List[str]
+    recent_records: List[CalibrationRecordResponse]
+

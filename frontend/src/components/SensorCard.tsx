@@ -99,7 +99,7 @@ export const SensorCards: React.FC<SensorCardProps> = ({ reading }) => {
           <div className="flex items-center justify-between">
             <span className="text-slate-400">Calibration State:</span>
             <span className={reading?.ph_calibrated ? 'font-medium text-emerald-600' : 'font-medium text-amber-600'}>
-              {reading?.ph_calibrated ? 'Two-Point Calibrated' : 'Factory Linear (pH 7.00 Reference)'}
+              {reading?.ph_calibrated ? 'Two-Point Calibrated' : 'Calibration Pending (Uncalibrated)'}
             </span>
           </div>
           <div className="flex items-center justify-between">
@@ -165,6 +165,12 @@ export const SensorCards: React.FC<SensorCardProps> = ({ reading }) => {
 
         {/* Technical Subtext & Safety Bounds */}
         <div className="mt-4 pt-3 border-t border-slate-100 text-xs text-slate-500 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-400">Calibration State:</span>
+            <span className={reading?.turbidity_calibrated ? 'font-medium text-emerald-600' : 'font-medium text-amber-600'}>
+              {reading?.turbidity_calibrated ? 'Two-Point Calibrated' : 'Calibration Pending (Uncalibrated)'}
+            </span>
+          </div>
           <div className="flex items-center justify-between">
             <span className="text-slate-400">Optical Response:</span>
             <span className="font-medium text-slate-700">

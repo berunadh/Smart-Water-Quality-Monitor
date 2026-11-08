@@ -136,14 +136,12 @@ private:
             _display.print(F("OVER-RANGE!"));
         } else if (ph.status == STATUS_DISCONNECTED) {
             _display.print(F("DISCONNECTED"));
-        } else if (ph.status == STATUS_CALIBRATION_PENDING) {
-            _display.print(F("CAL PEND ("));
-            _display.printf("%.2fV", ph.reconstructedVoltage);
-            _display.print(F(")"));
+        } else if (ph.status == STATUS_CALIBRATION_PENDING || isnan(ph.calibratedValue)) {
+            _display.printf("CAL PEND (%.2fV)", ph.reconstructedVoltage);
         } else if (ph.isValid) {
-            _display.printf("%.2f", ph.calibratedValue);
+            _display.printf("%.2f (%.2fV)", ph.calibratedValue, ph.reconstructedVoltage);
             if (ph.status == STATUS_WARNING || ph.status == STATUS_CRITICAL) {
-                _display.print(F(" [WARN]"));
+                _display.print(F("!"));
             }
         } else {
             _display.print(F("FAULT"));
@@ -156,12 +154,10 @@ private:
             _display.print(F("OVER-RANGE!"));
         } else if (turb.status == STATUS_DISCONNECTED) {
             _display.print(F("DISCONNECTED"));
-        } else if (turb.status == STATUS_CALIBRATION_PENDING) {
-            _display.print(F("CAL PEND ("));
-            _display.printf("%.2fV", turb.reconstructedVoltage);
-            _display.print(F(")"));
+        } else if (turb.status == STATUS_CALIBRATION_PENDING || isnan(turb.calibratedValue)) {
+            _display.printf("CAL PEND (%.2fV)", turb.reconstructedVoltage);
         } else if (turb.isValid) {
-            _display.printf("%.1f NTU", turb.calibratedValue);
+            _display.printf("%.1fNTU (%.2fV)", turb.calibratedValue, turb.reconstructedVoltage);
         } else {
             _display.print(F("FAULT"));
         }
