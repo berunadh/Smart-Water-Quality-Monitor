@@ -57,3 +57,10 @@ htmlcov/
 build/
 .vscode/
 .idea/
+
+# Node / React Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+

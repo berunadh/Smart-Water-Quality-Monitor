@@ -1,0 +1,150 @@
+import React from 'react';
+import {
+  Droplets,
+  Activity,
+  Wifi,
+  WifiOff,
+  Cloud,
+  RefreshCw,
+  AlertTriangle,
+  Bot,
+  BarChart3,
+  Cpu,
+  Layers,
+} from 'lucide-react';
+import { BackendHealth, SystemHealth } from '../types';
+
+interface HeaderProps {
+  health: BackendHealth | null;
+  system: SystemHealth | null;
+  activeTab: string;
+  setActiveTab: (tab: string) => void;
+  onRefresh: () => void;
+  isRefreshing: boolean;
+}
+
+export const Header: React.FC<HeaderProps> = ({
+  health,
+  system,
+  activeTab,
+  setActiveTab,
+  onRefresh,
+  isRefreshing,
+}) => {
+  const isDemo = health?.operating_mode === 'demo';
+  const isLive = health?.data_freshness === 'LIVE';
+  const isCloudConnected =
+    health?.cloud_connectivity === 'CONNECTED' ||
+    (isDemo && health?.cloud_connectivity?.includes('DEMO'));
+
+  const navItems = [
+    { id: 'dashboard', label: 'Dashboard', icon: Activity },
+    { id: 'analytics', label: 'Analytics', icon: BarChart3 },
+    { id: 'ml', label: 'ML Insights', icon: Layers },
+    { id: 'alerts', label: 'Alerts', icon: AlertTriangle },
+    { id: 'chatbot', label: 'AI Advisor', icon: Bot },
+    { id: 'diagnostics', label: 'Diagnostics', icon: Cpu },
+  ];
+
+  return (
+    <header className="sticky top-0 z-40 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="flex items-center justify-between h-16">
+          {/* Brand Identity */}
+          <div className="flex items-center space-x-3">
+            <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-sky-600 to-cyan-500 flex items-center justify-center text-white shadow-md shadow-sky-500/20">
+              <Droplets className="h-6 w-6" />
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h1 className="text-lg font-bold text-slate-900 tracking-tight">
+                  HydroSense IoT
+                </h1>
+                <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-slate-100 text-slate-600 border border-slate-200">
+                  v{health?.version || '2.0'}
+                </span>
+                {/* Operating Mode Badge */}
+                {isDemo ? (
+                  <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-amber-100 text-amber-800 border border-amber-300 animate-pulse">
+                    DEMO MODE
+                  </span>
+                ) : (
+                  <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                    REAL HARDWARE
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-500 hidden sm:block">
+                Smart Apartment Water Quality & Anomaly Monitor
+              </p>
+            </div>
+          </div>
+
+          {/* Status Indicators & Refresh */}
+          <div className="flex items-center space-x-3">
+            {/* Cloud & Live Pill */}
+            <div className="hidden md:flex items-center space-x-2 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs">
+              <span className="flex items-center space-x-1.5 text-slate-600">
+                <Cloud className="h-3.5 w-3.5 text-sky-500" />
+                <span>Cloud:</span>
+                <span className={isCloudConnected ? 'font-semibold text-emerald-600' : 'font-semibold text-amber-600'}>
+                  {health?.cloud_connectivity || 'Checking...'}
+                </span>
+              </span>
+
+              <span className="text-slate-300">|</span>
+
+              <span className="flex items-center space-x-1.5">
+                {system?.wifi_connected ? (
+                  <Wifi className="h-3.5 w-3.5 text-emerald-500" />
+                ) : (
+                  <WifiOff className="h-3.5 w-3.5 text-slate-400" />
+                )}
+                <span
+                  className={`inline-block w-2 h-2 rounded-full ${
+                    isLive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'
+                  }`}
+                />
+                <span className="text-slate-500 font-mono">
+                  {health?.data_freshness || 'SYNCING'}
+                </span>
+              </span>
+            </div>
+
+            {/* Refresh Button */}
+            <button
+              onClick={onRefresh}
+              disabled={isRefreshing}
+              title="Refresh all metrics from FastAPI backend"
+              className="p-2 rounded-lg text-slate-600 hover:text-sky-600 hover:bg-slate-100 transition-colors border border-slate-200 disabled:opacity-50"
+            >
+              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin text-sky-600' : ''}`} />
+            </button>
+          </div>
+        </div>
+
+        {/* Navigation Tabs */}
+        <div className="flex space-x-1 overflow-x-auto py-2 -mb-px border-t border-slate-100">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const isActive = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                onClick={() => setActiveTab(item.id)}
+                className={`flex items-center space-x-2 px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
+                  isActive
+                    ? 'bg-sky-50 text-sky-700 shadow-sm border border-sky-200/80'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/70 border border-transparent'
+                }`}
+              >
+                <Icon className={`h-4 w-4 ${isActive ? 'text-sky-600' : 'text-slate-400'}`} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </header>
+  );
+};
