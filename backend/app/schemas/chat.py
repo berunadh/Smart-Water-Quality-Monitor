@@ -18,3 +18,12 @@ class ChatResponse(BaseModel):
     timestamp: datetime
     context_used: Dict[str, Any]
     operating_mode: str
+    provider_status: Optional[str] = Field("active", description="Operational status or explanation if fallback engaged")
+
+
+class ChatbotStatusResponse(BaseModel):
+    configured_provider: str
+    model: str
+    api_key_configured: bool
+    status: str
+    details: str

@@ -13,7 +13,7 @@ from app.models.alert_log import AlertLogModel
 from app.schemas.sensor import SensorReadingResponse, SensorStatsResponse, SystemHealthResponse
 from app.schemas.alert import AlertResponse, AlertSummaryResponse
 from app.schemas.ml import AnomalyResponse, TrendResponse, MLSummaryResponse
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatRequest, ChatResponse, ChatbotStatusResponse
 from app.schemas.thingspeak import ThingSpeakSyncResult
 from app.services.thingspeak_service import ThingSpeakService
 from app.services.demo_service import DemoService
@@ -415,6 +415,15 @@ async def chat_with_advisor(
         db=db,
         session_id=request.session_id or "default_session",
     )
+
+
+@api_router.get("/chatbot/status", response_model=ChatbotStatusResponse, tags=["AI Chatbot"])
+def get_chatbot_status():
+    """
+    Returns the configured AI Chatbot provider, model, and operational status
+    without exposing credentials.
+    """
+    return chatbot_agent.get_provider_status()
 
 
 # ==============================================================================

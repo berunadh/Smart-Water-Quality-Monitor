@@ -153,6 +153,15 @@ export interface ChatResponse {
   timestamp: string;
   context_used: Record<string, any>;
   operating_mode: string;
+  provider_status?: string | null;
+}
+
+export interface ChatbotStatus {
+  configured_provider: string;
+  model: string;
+  api_key_configured: boolean;
+  status: string;
+  details: string;
 }
 
 export interface ChatMessage {
@@ -162,4 +171,5 @@ export interface ChatMessage {
   timestamp: string;
   source?: string;
   model?: string | null;
+  provider_status?: string | null;
 }

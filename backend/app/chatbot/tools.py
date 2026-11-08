@@ -7,6 +7,7 @@ from sqlalchemy import func
 
 from app.models.water_reading import WaterReadingModel
 from app.models.alert_log import AlertLogModel
+from app.models.chat_message import ChatMessageModel
 from app.core.config import settings
 from app.ml.trend_analyzer import TrendAnalyzer
 
@@ -143,3 +144,22 @@ class WaterChatbotTools:
             return {
                 "error": f"Unknown parameter '{parameter}'. Supported parameters: pH, Turbidity, TDS."
             }
+
+    @staticmethod
+    def get_recent_conversation_history(db: Session, session_id: str, limit: int = 6) -> List[Dict[str, str]]:
+        """Retrieves the recent conversation messages for the current session."""
+        try:
+            messages = (
+                db.query(ChatMessageModel)
+                .filter(ChatMessageModel.session_id == session_id)
+                .order_by(ChatMessageModel.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
+            # Return in chronological order
+            return [
+                {"role": m.role, "content": m.content}
+                for m in reversed(messages)
+            ]
+        except Exception:
+            return []

@@ -15,6 +15,7 @@ import {
   TrendResponse,
   MLSummary,
   ChatResponse,
+  ChatbotStatus,
 } from '../types';
 
 const API_BASE = '/api';
@@ -116,6 +117,12 @@ export const api = {
       body: JSON.stringify({ message, session_id: sessionId }),
     });
     return handleResponse<ChatResponse>(res);
+  },
+
+  /** Get Chatbot provider configuration and operational status */
+  async getChatbotStatus(): Promise<ChatbotStatus> {
+    const res = await fetch(`${API_BASE}/chatbot/status`);
+    return handleResponse<ChatbotStatus>(res);
   },
 
   /** Trigger a ThingSpeak cloud fetch sync */

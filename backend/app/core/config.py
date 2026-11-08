@@ -41,12 +41,14 @@ class Settings(BaseSettings):
 
     # AI Chatbot & LLM Settings
     LLM_PROVIDER: str = "fallback"  # Options: "gemini", "openai", "fallback"
-    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL: str = "gemini-3.1-flash-lite"
     LLM_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
+    GOOGLE_API_KEY: Optional[str] = None
+    LLM_REQUEST_TIMEOUT: float = 20.0
 
     model_config = SettingsConfigDict(
-        env_file=(".env", "backend/.env"),
+        env_file=(".env", "backend/.env", "../.env"),
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
