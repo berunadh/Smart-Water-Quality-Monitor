@@ -119,8 +119,7 @@ void loop() {
 
         // Evaluate system invariants, safety, and alert severity
         bool isWifi = cloudManager.isWifiConnected();
-        bool isCloudOk = (strcmp(cloudManager.getStatusText(), "SYNC") == 0 || 
-                          strcmp(cloudManager.getStatusText(), "IDLE") == 0);
+        bool isCloudOk = cloudManager.isCloudHealthy();
 
         sensorValidator.evaluate(phReading, turbReading, tdsReading, isWifi, isCloudOk);
     }
@@ -135,7 +134,7 @@ void loop() {
                           tdsReading, 
                           sensorValidator, 
                           cloudManager.isWifiConnected(), 
-                          cloudManager.getStatusText());
+                          cloudManager.getOledTag());
 
     // 4. Update Cloud Telemetry Manager (ThingSpeak HTTP POST every 20s)
     cloudManager.update(currentMillis, 
@@ -180,6 +179,8 @@ void processSerialCommands() {
         printHelpMenu();
     } else if (cmd.equalsIgnoreCase("status")) {
         printDiagnostics();
+    } else if (cmd.equalsIgnoreCase("net") || cmd.equalsIgnoreCase("wifi")) {
+        cloudManager.printNetworkDiagnostics();
     } else if (cmd.equalsIgnoreCase("cal_ph7")) {
         // Calibrate pH 7.00 buffer using current measured board voltage
         Serial.printf("[CAL] Calibrating pH 7.00 with current board voltage: %.3f V\n", phReading.reconstructedVoltage);
@@ -215,6 +216,7 @@ void printHelpMenu() {
     Serial.println(F("=========================================================="));
     Serial.println(F(" help            : Show this command menu"));
     Serial.println(F(" status          : Print comprehensive electrical diagnostics"));
+    Serial.println(F(" net             : Print Wi-Fi & ThingSpeak telemetry diagnostics"));
     Serial.println(F(" cal_ph7         : Set current pH probe voltage as pH 7.00 buffer"));
     Serial.println(F(" cal_ph4         : Set current pH probe voltage as pH 4.01 buffer"));
     Serial.println(F(" cal_turb_clear  : Set current turbidity probe as clear (0 NTU)"));
