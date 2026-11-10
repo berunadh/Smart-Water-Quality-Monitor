@@ -16,6 +16,7 @@ class ThingSpeakFeedItem(BaseModel):
     field5: Optional[str] = Field(None, description="pH Board Output Voltage (V)")
     field6: Optional[str] = Field(None, description="Turbidity Board Output Voltage (V)")
     field7: Optional[str] = Field(None, description="System Health Bitmask")
+    field8: Optional[str] = Field(None, description="TDS Direct ADC Voltage (V, GPIO35 1.0x)")
 
 
 class ThingSpeakChannelMeta(BaseModel):

@@ -321,6 +321,12 @@ public:
         // Field 7: System Health Bitmask (16-bit integer)
         postData += "&field7=" + String(validator.getHealthCode());
 
+        // Field 8 (Optional Diagnostic): TDS direct ADC voltage (GPIO35, 1.0x)
+        // Stored if Field 8 is enabled on ThingSpeak channel; cleanly ignored otherwise.
+        if (FEATURE_TDS_ENABLED && !isnan(tds.adcVoltage) && !isinf(tds.adcVoltage) && tds.adcVoltage >= 0.0f) {
+            postData += "&field8=" + String(tds.adcVoltage, 3);
+        }
+
         // --------------------------------------------------------------------
         // 5. Transmit HTTP POST to ThingSpeak API
         // --------------------------------------------------------------------

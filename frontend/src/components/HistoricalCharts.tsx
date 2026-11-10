@@ -239,7 +239,7 @@ export const HistoricalCharts: React.FC<HistoricalChartsProps> = ({
                   name="TDS (mg/L)"
                   stroke="#059669"
                   strokeWidth={2}
-                  dot={false}
+                  dot={{ r: 2.5 }}
                   activeDot={{ r: 4 }}
                   connectNulls={false}
                 />

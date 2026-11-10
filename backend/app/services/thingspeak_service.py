@@ -87,6 +87,7 @@ class ThingSpeakService:
             ph_v = ValidationService.parse_float_field(item.field5) or 0.0
             turb_v = ValidationService.parse_float_field(item.field6) or 0.0
             health = ValidationService.parse_int_field(item.field7, default=0)
+            tds_v = ValidationService.parse_float_field(item.field8)
 
             # Calibration flags: If field was sent, probe is calibrated; otherwise pending
             ph_cal = (ph is not None)
@@ -101,7 +102,7 @@ class ThingSpeakService:
                 turbidity_board_v=turb_v,
                 health_code=health,
                 timestamp=item.created_at,
-                tds_voltage=None,
+                tds_voltage=tds_v,
             )
 
             if not is_valid:
@@ -116,7 +117,7 @@ class ThingSpeakService:
                 tds=tds,  # STRICT: Remains None if omitted/uncalibrated
                 ph_voltage=ph_v,
                 turbidity_voltage=turb_v,
-                tds_voltage=None,
+                tds_voltage=tds_v,
                 ph_calibrated=ph_cal,
                 turbidity_calibrated=turb_cal,
                 tds_calibrated=tds_cal,

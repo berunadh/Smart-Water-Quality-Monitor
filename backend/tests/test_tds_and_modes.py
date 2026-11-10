@@ -168,7 +168,7 @@ def test_uncalibrated_sensors_never_normal_or_alerted(isolated_db):
 
 
 def test_thingspeak_calibrated_tds_ingestion(isolated_db):
-    """Verifies Field 3 parses calibrated TDS cleanly while leaving empty Field 3 as None."""
+    """Verifies Field 3 parses calibrated TDS and optional Field 8 preserves raw TDS voltage while empty Field 3 stays None."""
     now = datetime.utcnow()
     items = [
         ThingSpeakFeedItem(
@@ -181,6 +181,7 @@ def test_thingspeak_calibrated_tds_ingestion(isolated_db):
             field5="2.52",
             field6="4.20",
             field7="0",
+            field8="1.245",
         ),
         ThingSpeakFeedItem(
             entry_id=502,
@@ -192,18 +193,40 @@ def test_thingspeak_calibrated_tds_ingestion(isolated_db):
             field5="2.52",
             field6="4.20",
             field7="64",
+            field8="1.876",
+        ),
+        ThingSpeakFeedItem(
+            entry_id=503,
+            created_at=now + timedelta(seconds=40),
+            field1="7.20",
+            field2="0.6",
+            field3="",
+            field4="3",
+            field5="2.52",
+            field6="4.20",
+            field7="272",
+            field8="3.120",  # Direct GPIO35 over-range (>= 3.05V)
         ),
     ]
     res = ThingSpeakService.process_and_save_feeds(isolated_db, items)
-    assert res.new_records_saved == 2
+    assert res.new_records_saved == 3
+    assert res.validation_failures == 1
 
     r1 = isolated_db.query(WaterReadingModel).filter_by(entry_id=501).one()
     assert r1.tds == 345.0
     assert r1.tds_calibrated is True
+    assert r1.tds_voltage == 1.245
+    assert r1.is_valid is True
 
     r2 = isolated_db.query(WaterReadingModel).filter_by(entry_id=502).one()
     assert r2.tds is None
     assert r2.tds_calibrated is False
+    assert r2.tds_voltage == 1.876
+    assert r2.is_valid is True
+
+    r3 = isolated_db.query(WaterReadingModel).filter_by(entry_id=503).one()
+    assert r3.is_valid is False
+    assert "3.05V" in (r3.validation_notes or "")
 
 
 def test_ml_handles_tds_and_missing_values():

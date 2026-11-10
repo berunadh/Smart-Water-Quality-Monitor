@@ -402,11 +402,21 @@ void processSerialCommands() {
         Serial.println(F("[CAL-Turb] Turbidity sensor RESET. Status reverted to CALIBRATION_PENDING."));
     }
     // --- TDS Calibration Workflow (Direct 3.3V ADC on GPIO35, NO Divider) ---
-    else if (cmd.equalsIgnoreCase("tds cal") || cmd.startsWith("tds cal ") || cmd.startsWith("tds point ")) {
-        int spaceIdx = cmd.lastIndexOf(' ');
-        float stdPpm = (spaceIdx > 0) ? cmd.substring(spaceIdx + 1).toFloat() : 0.0f;
+    else if ([&]() {
+        String lower = cmd;
+        lower.toLowerCase();
+        return lower == "tds cal" || lower.startsWith("tds cal ") || lower.startsWith("tds point ");
+    }()) {
+        String lower = cmd;
+        lower.toLowerCase();
+        float stdPpm = 0.0f;
+        if (lower.startsWith("tds cal ")) {
+            stdPpm = cmd.substring(8).toFloat();
+        } else if (lower.startsWith("tds point ")) {
+            stdPpm = cmd.substring(10).toFloat();
+        }
         if (stdPpm < 10.0f || stdPpm > 3000.0f) {
-            Serial.println(F("[CAL-TDS] Specify a known TDS standard solution (10 - 3000 ppm), e.g. 'tds cal 342' or 'tds cal 707'."));
+            Serial.println(F("[CAL-TDS] Specify a known TDS standard solution in ppm (10 - 3000 ppm), e.g. 'tds cal 342' or 'tds cal 707'."));
             return;
         }
 
@@ -427,8 +437,13 @@ void processSerialCommands() {
                     Serial.println(F("[CAL-TDS] ERROR: Unscaled polynomial reading too small for reliable calibration."));
                 } else {
                     float candidateK = stdPpm / rawPoly;
+                    float calcTds = rawPoly * candidateK;
+                    float relErrPct = (fabs(calcTds - stdPpm) / stdPpm) * 100.0f;
                     if (candidateK < 0.15f || candidateK > 5.00f) {
                         Serial.printf("[CAL-TDS] ERROR: Derived cell constant k=%.3f outside plausible bounds (0.15 - 5.00).\n", candidateK);
+                    } else if (isnan(calcTds) || isinf(calcTds) || relErrPct > 5.0f) {
+                        Serial.printf("[CAL-TDS] ERROR: Computed TDS %.1f ppm deviates %.2f%% from reference %.1f ppm.\n",
+                                      calcTds, relErrPct, stdPpm);
                     } else {
                         pendingTdsVStd = avgV;
                         pendingTdsPpmStd = stdPpm;
@@ -440,6 +455,7 @@ void processSerialCommands() {
                         Serial.printf("Measured ADC Voltage (GPIO35)   : %.3f V (Direct 1.0x, σ=%.4f V)\n", pendingTdsVStd, stdDev);
                         Serial.printf("Unscaled Polynomial Output      : %.1f ppm\n", rawPoly);
                         Serial.printf("Derived Cell Constant (kFactor) : %.4f\n", candidateK);
+                        Serial.printf("Proposed Calculated TDS         : %.1f ppm (Error: %.2f%%)\n", calcTds, relErrPct);
                         Serial.println(F("Validation Status               : PASSED (Physically Plausible)"));
                         Serial.println(F("=================================================================="));
                         Serial.println(F("Type 'tds confirm' to commit to ESP32 Flash NVS, or 'tds cancel' to abort."));
@@ -455,6 +471,16 @@ void processSerialCommands() {
         if (tdsSensor.setCalibrationFromReference(pendingTdsPpmStd, pendingTdsVStd, true)) {
             Serial.println(F("[CAL-TDS] SUCCESS: TDS calibration COMMITTED to flash NVS."));
             Serial.println(F("[CAL-TDS] Live calibrated TDS ppm measurements are now ACTIVE."));
+            SensorReading verifyReading = tdsSensor.read();
+            tdsReading = verifyReading;
+            if (verifyReading.isValid && !isnan(verifyReading.calibratedValue)) {
+                float diffPct = ((verifyReading.calibratedValue - pendingTdsPpmStd) / pendingTdsPpmStd) * 100.0f;
+                Serial.printf("[CAL-TDS] Live Verification Readback  : %.1f ppm @ %.3f V (Ref: %.1f ppm, Diff: %+.2f%%)\n",
+                              verifyReading.calibratedValue, verifyReading.adcVoltage, pendingTdsPpmStd, diffPct);
+            } else {
+                Serial.printf("[CAL-TDS] WARNING: Post-confirm verification reported '%s' (Vadc=%.3f V).\n",
+                              verifyReading.message, verifyReading.adcVoltage);
+            }
             hasPendingTdsStd = false;
         } else {
             Serial.println(F("[CAL-TDS] ERROR: Validation failed when saving TDS calibration."));
@@ -584,6 +610,9 @@ void printCalibrationStatus() {
     if (tdsSensor.isCalibrated()) {
         Serial.printf("Calibrated kFactor  : %.4f (Ref %.0f ppm @ %.3f V)\n",
                       tdsSensor.getKFactor(), tdsSensor.getPpmStandard(), tdsSensor.getVStandard());
+        if (!isnan(tdsReading.calibratedValue)) {
+            Serial.printf("Live TDS Reading    : %.1f ppm\n", tdsReading.calibratedValue);
+        }
     }
     if (hasPendingTdsStd) {
         Serial.printf("Bench Staging       : %.1f ppm @ %.3fV recorded -> type 'tds confirm'\n",
