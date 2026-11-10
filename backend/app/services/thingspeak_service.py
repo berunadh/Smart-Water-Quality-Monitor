@@ -11,6 +11,7 @@ from app.models.water_reading import WaterReadingModel
 from app.models.alert_log import AlertLogModel
 from app.schemas.thingspeak import ThingSpeakFeedResponse, ThingSpeakFeedItem, ThingSpeakSyncResult
 from app.services.validation_service import ValidationService
+from app.services.mode_service import ModeService
 
 
 class ThingSpeakService:
@@ -70,6 +71,7 @@ class ThingSpeakService:
         new_count = 0
         failure_count = 0
         latest_id = None
+        mode_config = ModeService.get_or_create_config(db)
 
         for item in feed_items:
             # Prevent duplicate entries via entry_id
@@ -77,7 +79,7 @@ class ThingSpeakService:
             if existing:
                 continue
 
-            # Parse Fields
+            # Parse Fields (strictly preserve None for uncalibrated/missing values)
             ph = ValidationService.parse_float_field(item.field1)
             turbidity = ValidationService.parse_float_field(item.field2)
             tds = ValidationService.parse_float_field(item.field3)
@@ -91,20 +93,6 @@ class ThingSpeakService:
             turb_cal = (turbidity is not None)
             tds_cal = (tds is not None)
 
-            # Determine alert messages & health summary
-            if severity == 3:
-                alert_msg = "SENSOR FAULT / HAZARD"
-                health_summary = "SENSOR FAULT"
-            elif severity == 2:
-                alert_msg = "CRITICAL WATER QUALITY BREACH"
-                health_summary = "CRITICAL"
-            elif severity == 1:
-                alert_msg = "WATER QUALITY WARNING"
-                health_summary = "WARNING"
-            else:
-                alert_msg = "WATER SYSTEM NORMAL"
-                health_summary = "OPERATIONAL"
-
             is_valid, is_stale, notes = ValidationService.validate_reading(
                 ph=ph,
                 turbidity=turbidity,
@@ -113,6 +101,7 @@ class ThingSpeakService:
                 turbidity_board_v=turb_v,
                 health_code=health,
                 timestamp=item.created_at,
+                tds_voltage=None,
             )
 
             if not is_valid:
@@ -124,33 +113,59 @@ class ThingSpeakService:
                 timestamp=item.created_at,
                 ph=ph,
                 turbidity=turbidity,
-                tds=tds,  # STRICT: Remains None if omitted
+                tds=tds,  # STRICT: Remains None if omitted/uncalibrated
                 ph_voltage=ph_v,
                 turbidity_voltage=turb_v,
+                tds_voltage=None,
                 ph_calibrated=ph_cal,
                 turbidity_calibrated=turb_cal,
                 tds_calibrated=tds_cal,
                 alert_severity=severity,
                 health_code=health,
-                sensor_health_summary=health_summary,
-                alert_messages=alert_msg,
+                sensor_health_summary="OPERATIONAL",
+                alert_messages="WATER SYSTEM NORMAL",
                 data_source="thingspeak",
                 operating_mode="real",
+                water_quality_mode=mode_config.active_mode,
                 is_valid=is_valid,
                 is_stale=is_stale,
                 validation_notes=notes,
             )
+
+            # Evaluate against active water quality mode thresholds cleanly
+            evaluation = ModeService.evaluate_reading(record, mode_config)
+            if not is_valid:
+                record.alert_severity = 3
+                record.sensor_health_summary = "ELECTRICAL HAZARD"
+                record.alert_messages = notes or "ELECTRICAL SAFETY ALARM"
+            elif evaluation.violated_parameters:
+                record.alert_severity = evaluation.alert_severity
+                record.sensor_health_summary = "CRITICAL" if evaluation.alert_severity >= 2 else "WARNING"
+                record.alert_messages = "; ".join(evaluation.violated_parameters)
+            elif severity >= 3 or evaluation.overall_status == "SENSOR_FAULT":
+                record.alert_severity = 3
+                record.sensor_health_summary = "SENSOR FAULT"
+                record.alert_messages = "HARDWARE FAULT / PROBE DISCONNECTED"
+            elif evaluation.overall_status == "CALIBRATION_PENDING":
+                record.alert_severity = 0
+                record.sensor_health_summary = "CALIBRATION PENDING"
+                record.alert_messages = "CALIBRATION PENDING"
+            else:
+                record.alert_severity = 0
+                record.sensor_health_summary = "OPERATIONAL"
+                record.alert_messages = "WATER SYSTEM NORMAL"
+
             db.add(record)
             new_count += 1
             latest_id = item.entry_id
 
-            # Add to Alert Log if warning or critical
-            if severity > 0:
+            # Add to Alert Log ONLY for threshold breaches or electrical/sensor faults (never calibration pending)
+            if record.alert_severity > 0:
                 alert_log = AlertLogModel(
                     timestamp=item.created_at,
-                    severity=severity,
-                    title=alert_msg,
-                    message=notes or "Threshold breach reported by ESP32 sensor node.",
+                    severity=record.alert_severity,
+                    title=f"{evaluation.mode_label.upper()} ALERT" if evaluation.violated_parameters else record.sensor_health_summary,
+                    message=record.alert_messages,
                     resolved=False,
                 )
                 db.add(alert_log)

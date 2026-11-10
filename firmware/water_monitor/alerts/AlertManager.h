@@ -54,24 +54,31 @@ public:
         setBuzzer(true);
     }
 
-    void update(uint32_t currentMillis, AlertSeverity severity) {
-        // 1. Map severity to buzzer pattern
-        BuzzerPattern requestedPattern = PATTERN_OFF;
-        if (severity == SEVERITY_CRITICAL) {
-            requestedPattern = PATTERN_CRITICAL;
-        } else if (severity == SEVERITY_WARNING) {
-            requestedPattern = PATTERN_WARNING;
-        } else if (severity == SEVERITY_SENSOR_FAULT) {
-            requestedPattern = PATTERN_FAULT;
-        }
-
-        // If condition returned to normal, disarm buzzer immediately
-        if (requestedPattern == PATTERN_OFF && _pattern != PATTERN_STARTUP) {
-            _pattern = PATTERN_OFF;
-            _inCooldown = false;
-            setBuzzer(false);
+    /**
+     * Updates buzzer state machine cleanly without blocking.
+     * 
+     * STRICT RULE:
+     * Buzzer ONLY activates when thresholdViolated == true (i.e., at least one
+     * valid, calibrated sensor exceeds the active mode's allowed range).
+     * Never activates for uncalibrated sensors, disconnected probes, or faults.
+     */
+    void update(uint32_t currentMillis, AlertSeverity thresholdSeverity, bool thresholdViolated) {
+        // 1. Disarm immediately if no valid calibrated threshold violation exists
+        if (!thresholdViolated || thresholdSeverity < SEVERITY_WARNING) {
+            if (_pattern != PATTERN_STARTUP) {
+                _pattern = PATTERN_OFF;
+                _inCooldown = false;
+                setBuzzer(false);
+            } else {
+                executePattern(currentMillis);
+            }
             return;
         }
+
+        // 2. Map calibrated threshold violation severity to acoustic pattern
+        BuzzerPattern requestedPattern = (thresholdSeverity >= SEVERITY_CRITICAL)
+                                             ? PATTERN_CRITICAL
+                                             : PATTERN_WARNING;
 
         // Check acoustic cooldown to prevent infinite blaring
         if (_inCooldown) {

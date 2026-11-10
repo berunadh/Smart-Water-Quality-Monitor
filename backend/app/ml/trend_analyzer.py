@@ -50,9 +50,13 @@ class TrendAnalyzer:
         r_squared = float(r ** 2) if not np.isnan(r) else 0.0
 
         # Significance thresholds
-        # For pH: 0.05 units/hour is noticeable drift
-        # For Turbidity: 0.2 NTU/hour is noticeable increase
-        threshold_slope = 0.03 if param_name == "ph" else 0.15
+        # pH: 0.03 units/hour | Turbidity: 0.15 NTU/hour | TDS: 15.0 ppm/hour
+        if param_name == "ph":
+            threshold_slope = 0.03
+        elif param_name == "tds":
+            threshold_slope = 15.0
+        else:
+            threshold_slope = 0.15
 
         if abs(m) > threshold_slope and r_squared > 0.35:
             direction = "INCREASING" if m > 0 else "DECREASING"
@@ -93,13 +97,15 @@ class TrendAnalyzer:
                 total_samples=0,
             )
 
-        ph_trend = cls.calculate_linear_drift(df["timestamp"], df.get("ph", pd.Series()), "ph")
-        turb_trend = cls.calculate_linear_drift(df["timestamp"], df.get("turbidity", pd.Series()), "turbidity")
+        ph_trend = cls.calculate_linear_drift(df["timestamp"], df.get("ph", pd.Series(dtype=float)), "ph")
+        turb_trend = cls.calculate_linear_drift(df["timestamp"], df.get("turbidity", pd.Series(dtype=float)), "turbidity")
+        tds_trend = cls.calculate_linear_drift(df["timestamp"], df.get("tds", pd.Series(dtype=float)), "tds")
 
         return TrendResponse(
             status="SUCCESS",
             operating_mode=operating_mode,
             ph_drift=ph_trend,
             turbidity_drift=turb_trend,
+            tds_drift=tds_trend,
             total_samples=len(df),
         )

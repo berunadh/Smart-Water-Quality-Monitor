@@ -30,11 +30,11 @@ export const ChatbotPanel: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const suggestedQuestions = [
-    'Is the water currently safe to drink?',
-    'What causes high turbidity?',
-    'How can I improve apartment water quality?',
-    'Summarize recent ML anomaly detections and drift',
-    'Why is the TDS sensor reporting null?',
+    'How is my water quality right now?',
+    'Why is the warning showing?',
+    'What should I do next?',
+    'Is my water safe to drink?',
+    'How does changing Drinking vs Regular Usage mode affect alerts?',
   ];
 
   const scrollToBottom = () => {
@@ -142,14 +142,9 @@ export const ChatbotPanel: React.FC = () => {
             <Bot className="h-5 w-5" />
           </div>
           <div>
-            <div className="flex items-center space-x-2">
-              <h3 className="font-bold text-slate-900 text-sm">
-                AI Water Advisor &amp; Assistant
-              </h3>
-            </div>
-            <p className="text-[11px] text-slate-500">
-              Evaluates live IoT telemetry, physical standards, and anomaly logs
-            </p>
+            <h3 className="font-bold text-slate-900 text-sm">
+              AquaAdvisor AI
+            </h3>
           </div>
         </div>
 

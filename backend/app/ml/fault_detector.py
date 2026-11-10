@@ -26,7 +26,7 @@ class SensorFaultDetector:
         faults: List[AnomalyItem] = []
 
         # 1. Check for Stuck Value Patterns (Op-amp lockup or frozen ADC)
-        for col in ["ph_voltage", "turbidity_voltage", "ph", "turbidity"]:
+        for col in ["ph_voltage", "turbidity_voltage", "tds_voltage", "ph", "turbidity", "tds"]:
             if col not in df.columns:
                 continue
 
@@ -62,8 +62,8 @@ class SensorFaultDetector:
                 )
 
         # 2. Check for Disconnected Probes or Ground Loss
-        if "ph_voltage" in df.columns:
-            last_ph_v = float(df["ph_voltage"].iloc[-1])
+        if "ph_voltage" in df.columns and df["ph_voltage"].notna().any():
+            last_ph_v = float(df["ph_voltage"].dropna().iloc[-1])
             if last_ph_v < 0.08:
                 faults.append(
                     AnomalyItem(
@@ -79,11 +79,11 @@ class SensorFaultDetector:
                 )
 
         # 3. Check for Electrical Over-Range
-        for v_col, name in [("ph_voltage", "pH"), ("turbidity_voltage", "Turbidity")]:
-            if v_col in df.columns:
-                last_v = float(df[v_col].iloc[-1])
-                # V_ADC = V_board * 0.40 -> if V_board > 7.625V, ADC > 3.05V
-                if last_v * 0.40 >= 3.05:
+        for v_col, name, ratio in [("ph_voltage", "pH", 0.40), ("turbidity_voltage", "Turbidity", 0.40), ("tds_voltage", "TDS", 1.00)]:
+            if v_col in df.columns and df[v_col].notna().any():
+                last_v = float(df[v_col].dropna().iloc[-1])
+                # pH & Turbidity: V_ADC = V_board * 0.40; TDS: Direct V_ADC (1.00x)
+                if last_v * ratio >= 3.05:
                     faults.append(
                         AnomalyItem(
                             timestamp=df["timestamp"].iloc[-1] if "timestamp" in df.columns else None,
@@ -93,15 +93,15 @@ class SensorFaultDetector:
                             detector_type="hardware_fault_detector",
                             anomaly_type="ELECTRICAL_OVER_RANGE",
                             human_explanation=(
-                                f"CRITICAL ELECTRICAL HAZARD: {name} sensor board output ({last_v:.2f}V) "
-                                "exceeds safe divider limit, producing >3.05V at ESP32 ADC pin."
+                                f"CRITICAL ELECTRICAL HAZARD: {name} voltage ({last_v:.2f}V) "
+                                "exceeds safe limit, producing >=3.05V at ESP32 ADC pin."
                             ),
                             category="RULE_BASED_WARNING",
                         )
                     )
 
         # 4. Check for Implausible Step Jumps
-        for col, max_jump in [("ph", 2.5), ("turbidity", 50.0)]:
+        for col, max_jump in [("ph", 2.5), ("turbidity", 50.0), ("tds", 350.0)]:
             if col in df.columns and len(df[col].dropna()) >= 2:
                 diffs = df[col].dropna().diff().abs()
                 max_diff = float(diffs.max())

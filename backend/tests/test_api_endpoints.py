@@ -23,7 +23,7 @@ def test_system_status():
     assert "overall_status" in data
     assert "electrical_safe" in data
     assert "tds_installed" in data
-    assert data["tds_installed"] is False  # TDS absent in Phase 2
+    assert data["tds_installed"] is True  # TDS probe integrated on GPIO35
 
 
 def test_readings_latest():
@@ -33,7 +33,9 @@ def test_readings_latest():
     if data:
         assert "ph" in data
         assert "turbidity" in data
-        assert data["tds"] is None  # TDS must be null
+        assert "tds" in data
+        assert "tds_voltage" in data
+        assert "water_quality_mode" in data
         assert "operating_mode" in data
         assert "data_source" in data
 
@@ -100,5 +102,15 @@ def test_demo_inject_endpoint():
     res = client.post("/api/demo/inject/warning")
     assert res.status_code == 200
     data = res.json()
-    assert data["alert_severity"] == 1
-    assert data["tds"] is None
+    assert "alert_severity" in data
+    assert "tds_voltage" in data
+
+    # Uncalibrated demo scenario must strictly preserve null calibrated metrics
+    res_uncal = client.post("/api/demo/inject/uncalibrated")
+    assert res_uncal.status_code == 200
+    uncal_data = res_uncal.json()
+    assert uncal_data["ph"] is None
+    assert uncal_data["turbidity"] is None
+    assert uncal_data["tds"] is None
+    assert uncal_data["tds_calibrated"] is False
+    assert uncal_data["alert_severity"] == 0

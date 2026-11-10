@@ -110,6 +110,10 @@ private:
                          bool wifiConnected,
                          const char* cloudStatus) {
         AlertSeverity sev = validator.getSeverity();
+        const char* sevTag = "NORM";
+        if (sev == SEVERITY_WARNING) sevTag = "WARN";
+        else if (sev == SEVERITY_CRITICAL) sevTag = "CRIT";
+        else if (sev == SEVERITY_SENSOR_FAULT) sevTag = "FLT!";
 
         // Header Bar
         if (sev >= SEVERITY_WARNING && _flashState) {
@@ -117,15 +121,15 @@ private:
             _display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
             _display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
             _display.setTextSize(1);
-            _display.setCursor(4, 2);
-            _display.print(validator.getAlertMessage());
+            _display.setCursor(2, 2);
+            _display.printf("%s: %.16s", validator.getModeShortTag(), validator.getAlertMessage());
             _display.setTextColor(SSD1306_WHITE);
         } else {
             _display.setTextSize(1);
             _display.setCursor(0, 0);
-            _display.print(F("AQUA-MONITOR"));
+            _display.printf("HYDROSENSE [%s]", validator.getModeShortTag());
             _display.setCursor(92, 0);
-            _display.printf("[%s]", validator.getSeverityName());
+            _display.printf("[%s]", sevTag);
             _display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
         }
 
@@ -137,12 +141,10 @@ private:
         } else if (ph.status == STATUS_DISCONNECTED) {
             _display.print(F("DISCONNECTED"));
         } else if (ph.status == STATUS_CALIBRATION_PENDING || isnan(ph.calibratedValue)) {
-            _display.printf("CAL PEND (%.2fV)", ph.reconstructedVoltage);
+            _display.printf("CAL PEND(%.2fV)", ph.reconstructedVoltage);
         } else if (ph.isValid) {
-            _display.printf("%.2f (%.2fV)", ph.calibratedValue, ph.reconstructedVoltage);
-            if (ph.status == STATUS_WARNING || ph.status == STATUS_CRITICAL) {
-                _display.print(F("!"));
-            }
+            _display.printf("%.2f (%.2fV)%s", ph.calibratedValue, ph.reconstructedVoltage,
+                            validator.isPhViolated() ? "!" : "");
         } else {
             _display.print(F("FAULT"));
         }
@@ -155,20 +157,30 @@ private:
         } else if (turb.status == STATUS_DISCONNECTED) {
             _display.print(F("DISCONNECTED"));
         } else if (turb.status == STATUS_CALIBRATION_PENDING || isnan(turb.calibratedValue)) {
-            _display.printf("CAL PEND (%.2fV)", turb.reconstructedVoltage);
+            _display.printf("CAL PEND(%.2fV)", turb.reconstructedVoltage);
         } else if (turb.isValid) {
-            _display.printf("%.1fNTU (%.2fV)", turb.calibratedValue, turb.reconstructedVoltage);
+            _display.printf("%.1fNTU(%.2fV)%s", turb.calibratedValue, turb.reconstructedVoltage,
+                            validator.isTurbViolated() ? "!" : "");
         } else {
             _display.print(F("FAULT"));
         }
 
-        // 3. TDS Reading (Mandatory: Always N/A until physically installed)
+        // 3. TDS Reading (Direct 3.3V ADC; strictly N/A or CAL PEND until calibrated)
         _display.setCursor(0, 38);
         _display.print(F("TDS : "));
-        if (!tds.isValid || tds.status == STATUS_UNAVAILABLE) {
-            _display.print(F("N/A (PENDING)"));
+        if (tds.status == STATUS_UNAVAILABLE) {
+            _display.print(F("N/A (DISABLED)"));
+        } else if (tds.status == STATUS_OVER_RANGE) {
+            _display.print(F("OVER-RANGE!"));
+        } else if (tds.status == STATUS_DISCONNECTED) {
+            _display.printf("NO SIG (%.2fV)", tds.adcVoltage);
+        } else if (tds.status == STATUS_CALIBRATION_PENDING || isnan(tds.calibratedValue)) {
+            _display.printf("CAL PEND(%.2fV)", tds.adcVoltage);
+        } else if (tds.isValid) {
+            _display.printf("%.0fppm(%.2fV)%s", tds.calibratedValue, tds.adcVoltage,
+                            validator.isTdsViolated() ? "!" : "");
         } else {
-            _display.printf("%.0f ppm", tds.calibratedValue);
+            _display.print(F("FAULT"));
         }
 
         // Bottom Status Bar
@@ -189,28 +201,27 @@ private:
         // Header
         _display.setTextSize(1);
         _display.setCursor(0, 0);
-        _display.print(F("ELECTRICAL DIAGNOSTICS"));
+        _display.printf("VOLTS [%s]     P2/2", validator.getModeShortTag());
         _display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
         // pH Electrical
         _display.setCursor(0, 14);
-        _display.printf("pH  ADC:%.3fV (Vin:%.2f)", ph.adcVoltage, ph.reconstructedVoltage);
+        _display.printf("pH  :%.3fV -> %.2fV", ph.adcVoltage, ph.reconstructedVoltage);
 
         // Turbidity Electrical
         _display.setCursor(0, 26);
-        _display.printf("Turb ADC:%.3fV (Vin:%.2f)", turb.adcVoltage, turb.reconstructedVoltage);
+        _display.printf("Turb:%.3fV -> %.2fV", turb.adcVoltage, turb.reconstructedVoltage);
 
-        // Safety Status
+        // TDS Electrical (Direct 3.3V - No Divider)
         _display.setCursor(0, 38);
-        if (ph.adcVoltage >= ADC_OVER_RANGE_VOLTS || turb.adcVoltage >= ADC_OVER_RANGE_VOLTS) {
-            _display.print(F("SAFETY: DANGER (>3.05V)"));
-        } else {
-            _display.print(F("SAFETY: SAFE (<3.0V)"));
-        }
+        _display.printf("TDS :%.3fV (Direct)", tds.adcVoltage);
 
-        // Health Code Bitmask
+        // Safety & Health Code Bitmask
+        bool hazard = (ph.adcVoltage >= ADC_OVER_RANGE_VOLTS ||
+                       turb.adcVoltage >= ADC_OVER_RANGE_VOLTS ||
+                       tds.adcVoltage >= ADC_OVER_RANGE_VOLTS);
         _display.drawLine(0, 50, 127, 50, SSD1306_WHITE);
         _display.setCursor(0, 54);
-        _display.printf("Health:0x%04X | P:1/2", validator.getHealthCode());
+        _display.printf("H:0x%04X | %s", validator.getHealthCode(), hazard ? "ADC DANGER!" : "ADC SAFE");
     }
 };

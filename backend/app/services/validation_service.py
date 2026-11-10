@@ -17,9 +17,11 @@ class ValidationService:
         turbidity_board_v: float,
         health_code: int,
         timestamp: Optional[datetime] = None,
+        tds_voltage: Optional[float] = None,
     ) -> Tuple[bool, bool, Optional[str]]:
         """
         Validates electrical plausibility, physical bounds, staleness, and missing sensor integrity.
+        Note: pH & Turbidity use 15k/10k voltage dividers (0.40x), while TDS uses direct 3.3V ADC (1.0x).
         Returns: (is_valid: bool, is_stale: bool, validation_notes: Optional[str])
         """
         notes = []
@@ -33,7 +35,7 @@ class ValidationService:
                 notes.append(f"STALE: Reading is {int(age_seconds / 60)} minutes old")
 
         # 2. Electrical Invariant Verification (ADC limit safety)
-        # ADC pin voltage is V_board * 0.40
+        # pH & Turbidity ADC pin voltage is V_board * 0.40; TDS has NO divider (V_ADC directly)
         ph_adc_est = ph_board_v * settings.VOLTAGE_DIVIDER_RATIO
         turb_adc_est = turbidity_board_v * settings.VOLTAGE_DIVIDER_RATIO
 
@@ -41,10 +43,14 @@ class ValidationService:
             return False, is_stale, f"HAZARD: pH ADC voltage ({ph_adc_est:.2f}V) exceeds 3.05V safety limit!"
         if turb_adc_est >= settings.ADC_SAFE_VOLTAGE_MAX:
             return False, is_stale, f"HAZARD: Turbidity ADC voltage ({turb_adc_est:.2f}V) exceeds 3.05V safety limit!"
+        if tds_voltage is not None and tds_voltage >= settings.ADC_SAFE_VOLTAGE_MAX:
+            return False, is_stale, f"HAZARD: TDS ADC voltage ({tds_voltage:.2f}V) exceeds 3.05V safety limit!"
 
-        # 3. TDS Integrity Check (Strict Rule: Missing TDS must NEVER be 0.0)
+        # 3. TDS Integrity Check (Strict Rule: Uninstalled/uncalibrated TDS must NEVER be 0.0)
         if tds == 0.0:
-            notes.append("WARNING: TDS reported as 0.0. If sensor is absent, value should be NULL.")
+            notes.append("WARNING: TDS reported as 0.0. If sensor is absent or uncalibrated, value should be NULL.")
+        if tds is not None and (tds < 0.0 or tds > 5000.0):
+            return False, is_stale, f"PHYSICAL BOUND VIOLATION: TDS {tds} ppm outside [0, 5000]"
 
         # 4. pH Physical Sanity Check
         if ph is not None:

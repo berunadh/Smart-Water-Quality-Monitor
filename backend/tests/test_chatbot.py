@@ -202,7 +202,7 @@ async def test_agent_conversation_history_follow_up(chat_db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_agent_telemetry_grounding(chat_db, monkeypatch):
-    """Agent injects current sensor telemetry, TDS null status, and ML insights into prompt."""
+    """Agent injects active mode thresholds, all 3 sensors (including GPIO35 TDS), and ML stats into prompt."""
     captured_prompt = []
 
     class MockGemini(BaseLLMAdapter):
@@ -216,11 +216,12 @@ async def test_agent_telemetry_grounding(chat_db, monkeypatch):
     await agent.answer_query("Summarize current sensor status", chat_db)
     assert len(captured_prompt) == 1
     prompt_text = captured_prompt[0]
+    assert "ACTIVE WATER QUALITY MODE & THRESHOLDS" in prompt_text
     assert "CURRENT SYSTEM TELEMETRY" in prompt_text
     assert "Calibrated pH" in prompt_text
-    assert "TDS Sensor" in prompt_text
-    assert "NULL (Uninstalled, Reserved on GPIO35)" in prompt_text
-    assert "24-HOUR HISTORICAL SUMMARY" in prompt_text
+    assert "Calibrated TDS" in prompt_text
+    assert "GPIO35 Direct 3.3V" in prompt_text
+    assert "24-HOUR HISTORICAL STATS & TRENDS" in prompt_text
 
 
 @pytest.mark.asyncio

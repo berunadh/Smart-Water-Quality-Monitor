@@ -39,6 +39,7 @@ class TrendResponse(BaseModel):
     operating_mode: str
     ph_drift: TrendItem
     turbidity_drift: TrendItem
+    tds_drift: Optional[TrendItem] = None
     total_samples: int
 
 

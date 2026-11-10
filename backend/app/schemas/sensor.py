@@ -18,17 +18,19 @@ class SensorReadingBase(BaseModel):
     tds: Optional[float] = Field(None, ge=0.0, description="Calibrated TDS in ppm (STRICT: null when uninstalled)")
     ph_voltage: float = Field(..., ge=0.0, description="pH signal board output voltage (V)")
     turbidity_voltage: float = Field(..., ge=0.0, description="Turbidity signal board output voltage (V)")
+    tds_voltage: Optional[float] = Field(None, ge=0.0, description="TDS direct ADC input voltage on GPIO35 (V, no divider)")
     ph_board_voltage: Optional[float] = Field(None, description="Alias for ph_voltage")
     turbidity_board_voltage: Optional[float] = Field(None, description="Alias for turbidity_voltage")
     ph_calibrated: bool = Field(False, description="True only if pH probe has undergone two-point buffer calibration")
     turbidity_calibrated: bool = Field(False, description="True only if optical probe has undergone baseline calibration")
-    tds_calibrated: bool = Field(False, description="TDS calibration status (false in Phase 1)")
+    tds_calibrated: bool = Field(False, description="True only if TDS probe has undergone reference standard calibration")
     alert_severity: int = Field(0, ge=0, le=3, description="0=Normal, 1=Warning, 2=Critical, 3=Fault")
     alert_messages: str = Field("NORMAL", description="Active alert banner or message")
     sensor_health_summary: str = Field("OPERATIONAL", description="Human-readable health status")
     health_code: int = Field(0, description="16-bit System health bitmask")
     data_source: str = Field("thingspeak", description="'thingspeak', 'simulated', or 'sensor_node'")
     operating_mode: str = Field("real", description="'real' or 'demo'")
+    water_quality_mode: str = Field("drinking", description="'drinking' or 'regular_usage'")
     is_valid: bool = Field(True, description="True if passes electrical safety and physical plausibility bounds")
     is_stale: bool = Field(False, description="True if reading timestamp exceeds freshness threshold")
 
@@ -82,12 +84,14 @@ class SystemHealthResponse(BaseModel):
     cloud_synced: bool
     ph_sensor_healthy: bool
     turbidity_sensor_healthy: bool
+    tds_sensor_healthy: bool = True
     electrical_safe: bool
     tds_installed: bool
     calibration_pending: bool
     demo_mode: bool
     overall_status: str
     operating_mode: str
+    water_quality_mode: str = "drinking"
     data_freshness: str
     last_cloud_sync: Optional[datetime] = None
 
@@ -97,7 +101,8 @@ class SystemHealthResponse(BaseModel):
         code: int, 
         operating_mode: str = "real",
         last_sync: Optional[datetime] = None,
-        is_stale: bool = False
+        is_stale: bool = False,
+        water_quality_mode: str = "drinking",
     ) -> "SystemHealthResponse":
         # Health bitmask:
         # Bit 0: HEALTH_WIFI_DISCONNECTED
@@ -108,10 +113,13 @@ class SystemHealthResponse(BaseModel):
         # Bit 5: HEALTH_TDS_UNAVAILABLE
         # Bit 6: HEALTH_CALIBRATION_PENDING
         # Bit 7: HEALTH_DEMO_MODE_ACTIVE
+        # Bit 8: HEALTH_TDS_FAULT
+        # Bit 9: HEALTH_MODE_REGULAR
         wifi_ok = not bool(code & (1 << 0))
         cloud_ok = not bool(code & (1 << 1))
         ph_ok = not bool(code & (1 << 2))
         turb_ok = not bool(code & (1 << 3))
+        tds_ok = not bool(code & (1 << 8))
         safe = not bool(code & (1 << 4))
         tds_present = not bool(code & (1 << 5))
         cal_pending = bool(code & (1 << 6))
@@ -119,7 +127,7 @@ class SystemHealthResponse(BaseModel):
 
         if not safe:
             status = "ELECTRICAL HAZARD"
-        elif not ph_ok or not turb_ok:
+        elif not ph_ok or not turb_ok or not tds_ok:
             status = "SENSOR FAULT"
         elif is_stale:
             status = "STALE DATA"
@@ -136,12 +144,14 @@ class SystemHealthResponse(BaseModel):
             cloud_synced=cloud_ok,
             ph_sensor_healthy=ph_ok,
             turbidity_sensor_healthy=turb_ok,
+            tds_sensor_healthy=tds_ok,
             electrical_safe=safe,
             tds_installed=tds_present,
             calibration_pending=cal_pending,
             demo_mode=demo,
             overall_status=status,
             operating_mode=operating_mode,
+            water_quality_mode=water_quality_mode,
             data_freshness=freshness,
             last_cloud_sync=last_sync,
         )
@@ -174,7 +184,9 @@ class CalibrationStatusDetail(BaseModel):
     calibration_pending: bool
     ph_voltage: float
     turbidity_voltage: float
+    tds_voltage: Optional[float] = None
     ph_reference_standards: List[str]
     turbidity_reference_standards: List[str]
+    tds_reference_standards: List[str] = []
     recent_records: List[CalibrationRecordResponse]
 

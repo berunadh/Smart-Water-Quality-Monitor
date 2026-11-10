@@ -1,7 +1,8 @@
 /**
- * TypeScript Interfaces and Data Types for Smart Water Quality Monitor.
- * All schemas mirror the Phase 2 FastAPI backend models.
+ * TypeScript Interfaces for HydroSense Smart Water Quality Monitor.
  */
+
+export type WaterQualityMode = 'drinking' | 'regular_usage';
 
 export interface SensorReading {
   id: number;
@@ -9,9 +10,10 @@ export interface SensorReading {
   device_id: string;
   ph: number | null;
   turbidity: number | null;
-  tds: number | null; // STRICT: null when uninstalled, NEVER 0
+  tds: number | null; // STRICT: null when uncalibrated or unavailable, NEVER 0
   ph_voltage: number;
   turbidity_voltage: number;
+  tds_voltage?: number | null;
   ph_board_voltage?: number | null;
   turbidity_board_voltage?: number | null;
   ph_calibrated: boolean;
@@ -23,6 +25,7 @@ export interface SensorReading {
   health_code: number;
   data_source: string;
   operating_mode: string;
+  water_quality_mode?: WaterQualityMode | string;
   is_valid: boolean;
   is_stale: boolean;
   timestamp: string;
@@ -34,6 +37,7 @@ export interface BackendHealth {
   service: string;
   version: string;
   operating_mode: 'real' | 'demo' | string;
+  water_quality_mode?: WaterQualityMode | string;
   cloud_connectivity: string;
   last_successful_telemetry: string | null;
   data_freshness: string;
@@ -46,14 +50,79 @@ export interface SystemHealth {
   cloud_synced: boolean;
   ph_sensor_healthy: boolean;
   turbidity_sensor_healthy: boolean;
+  tds_sensor_healthy?: boolean;
   electrical_safe: boolean;
   tds_installed: boolean;
   calibration_pending: boolean;
   demo_mode: boolean;
   overall_status: string;
   operating_mode: string;
+  water_quality_mode?: WaterQualityMode | string;
   data_freshness: string;
   last_cloud_sync: string | null;
+}
+
+export interface ModeThresholdProfile {
+  ph_min: number;
+  ph_max: number;
+  turbidity_max: number;
+  tds_max: number;
+  label: string;
+  reference_note: string;
+  is_regulatory_reference: boolean;
+}
+
+export interface ParameterEvaluation {
+  parameter: string;
+  status: 'acceptable' | 'warning' | 'exceeded' | 'uncalibrated' | 'unavailable' | 'fault' | string;
+  value: number | null;
+  unit: string;
+  limit_text: string;
+  message: string;
+}
+
+export interface WaterQualityEvaluation {
+  active_mode: WaterQualityMode;
+  mode_label: string;
+  overall_status: string;
+  alert_severity: number;
+  violated_parameters: string[];
+  parameter_evaluations: Record<string, ParameterEvaluation>;
+  preliminary_disclaimer: string;
+}
+
+export interface WaterQualitySettings {
+  active_mode: WaterQualityMode;
+  active_profile: ModeThresholdProfile;
+  drinking_profile: ModeThresholdProfile;
+  regular_usage_profile: ModeThresholdProfile;
+  preliminary_disclaimer: string;
+  updated_at: string;
+  latest_evaluation: WaterQualityEvaluation | null;
+}
+
+export interface CalibrationRecord {
+  id: number;
+  timestamp: string;
+  sensor_type: string;
+  point_name: string;
+  reference_value: number;
+  measured_voltage: number;
+  operator_notes?: string | null;
+}
+
+export interface CalibrationStatusDetail {
+  ph_calibrated: boolean;
+  turbidity_calibrated: boolean;
+  tds_calibrated: boolean;
+  calibration_pending: boolean;
+  ph_voltage: number;
+  turbidity_voltage: number;
+  tds_voltage?: number | null;
+  ph_reference_standards: string[];
+  turbidity_reference_standards: string[];
+  tds_reference_standards: string[];
+  recent_records: CalibrationRecord[];
 }
 
 export interface SensorStatistics {
@@ -72,7 +141,7 @@ export interface SensorStatistics {
 export interface AlertItem {
   id: number;
   timestamp: string;
-  severity: number; // 1=Warning, 2=Critical, 3=Fault
+  severity: number;
   title: string;
   message: string;
   resolved: boolean;
@@ -94,10 +163,10 @@ export interface AnomalyItem {
   baseline_mean: number | null;
   baseline_std: number | null;
   anomaly_score: number;
-  detector_type: 'zscore' | 'isolation_forest' | 'mad' | string;
+  detector_type: string;
   anomaly_type: string;
   human_explanation: string;
-  category: 'MEASURED_FACT' | 'STATISTICAL_ANOMALY' | 'ML_PREDICTION' | 'RULE_BASED_WARNING' | string;
+  category: string;
 }
 
 export interface AnomalyResponse {
@@ -112,7 +181,7 @@ export interface TrendItem {
   slope_per_hour: number;
   intercept: number | null;
   r_squared: number;
-  trend_direction: 'INCREASING' | 'DECREASING' | 'STABLE' | 'INSUFFICIENT_DATA';
+  trend_direction: 'INCREASING' | 'DECREASING' | 'STABLE' | 'INSUFFICIENT_DATA' | 'NO_DATA';
   explanation: string;
 }
 
@@ -121,11 +190,13 @@ export interface TrendResponse {
   operating_mode: string;
   ph_drift: TrendItem;
   turbidity_drift: TrendItem;
+  tds_drift?: TrendItem | null;
   total_samples: number;
 }
 
 export interface InsightDetail {
-  category: 'MEASURED_FACT' | 'STATISTICAL_ANOMALY' | 'ML_PREDICTION' | 'RULE_BASED_WARNING' | string;
+  type?: string;
+  category?: string;
   message: string;
   parameter?: string;
 }
@@ -138,11 +209,6 @@ export interface MLSummary {
   dominant_trend: string;
   insights: InsightDetail[];
   model_metadata: Record<string, any>;
-}
-
-export interface ChatRequest {
-  message: string;
-  session_id?: string;
 }
 
 export interface ChatResponse {

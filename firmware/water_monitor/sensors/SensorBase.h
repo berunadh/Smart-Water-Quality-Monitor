@@ -111,10 +111,18 @@ protected:
 
     /**
      * Collects multiple oversampled readings over a stabilization window,
-     * calculating the average reconstructed board voltage and sample standard deviation.
-     * Used by calibration routines to verify measurement stability before acceptance.
+     * calculating the average voltage (scaled by voltageMultiplier: 2.5x for
+     * divider-protected sensors, 1.0x for direct 3.3V sensors like TDS)
+     * and sample standard deviation for stability verification.
      */
-    bool sampleStableVoltage(uint8_t pin, uint8_t sampleCount, uint16_t delayMs, float& avgVoltage, float& stdDev) {
+    bool sampleStableVoltage(
+        uint8_t pin,
+        uint8_t sampleCount,
+        uint16_t delayMs,
+        float& avgVoltage,
+        float& stdDev,
+        float voltageMultiplier = VOLTAGE_RECONSTRUCT_FACTOR
+    ) {
         if (sampleCount < 5) sampleCount = 5;
         if (sampleCount > 50) sampleCount = 50;
 
@@ -124,7 +132,7 @@ protected:
         for (uint8_t i = 0; i < sampleCount; i++) {
             float raw = sampleAdcTrimmed(pin, 15, 2);
             float vadc = rawToAdcVoltage(raw);
-            voltages[i] = adcToReconstructedVoltage(vadc);
+            voltages[i] = vadc * voltageMultiplier;
             sum += voltages[i];
             if (delayMs > 0) delay(delayMs);
         }

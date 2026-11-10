@@ -23,9 +23,16 @@ from app.schemas.alert import AlertResponse, AlertSummaryResponse
 from app.schemas.ml import AnomalyResponse, TrendResponse, MLSummaryResponse
 from app.schemas.chat import ChatRequest, ChatResponse, ChatbotStatusResponse
 from app.schemas.thingspeak import ThingSpeakSyncResult
+from app.schemas.mode import (
+    WaterQualityModeLiteral,
+    WaterQualitySettingsResponse,
+    ModeSwitchRequest,
+    ThresholdUpdateRequest,
+)
 from app.services.thingspeak_service import ThingSpeakService
 from app.services.demo_service import DemoService
 from app.services.alert_service import AlertService
+from app.services.mode_service import ModeService
 from app.ml.anomaly_detector import RobustStatisticalDetector, IsolationForestDetector
 from app.ml.fault_detector import SensorFaultDetector
 from app.ml.trend_analyzer import TrendAnalyzer
@@ -64,11 +71,14 @@ def get_backend_health(db: Session = Depends(get_db)):
     if settings.DATA_MODE == "demo":
         cloud_status = "DEMO_MODE (SIMULATED)"
 
+    config = ModeService.get_or_create_config(db)
+
     return {
         "status": "healthy",
         "service": settings.PROJECT_NAME,
         "version": settings.VERSION,
         "operating_mode": settings.DATA_MODE,
+        "water_quality_mode": config.active_mode,
         "cloud_connectivity": cloud_status,
         "last_successful_telemetry": last_sync.isoformat() if last_sync else None,
         "data_freshness": "STALE" if is_stale else "LIVE",
@@ -82,6 +92,7 @@ def get_system_status(db: Session = Depends(get_db)):
     Decodes the 16-bit hardware health bitmask from the latest telemetry record,
     reporting sensor availability, electrical safety, and Wi-Fi state.
     """
+    config = ModeService.get_or_create_config(db)
     latest = (
         db.query(WaterReadingModel)
         .order_by(WaterReadingModel.timestamp.desc())
@@ -95,17 +106,19 @@ def get_system_status(db: Session = Depends(get_db)):
 
     if not latest:
         return SystemHealthResponse(
-            raw_code=0x0020,  # TDS unavailable
+            raw_code=0x0020,
             wifi_connected=False,
             cloud_synced=False,
             ph_sensor_healthy=True,
             turbidity_sensor_healthy=True,
+            tds_sensor_healthy=True,
             electrical_safe=True,
             tds_installed=False,
             calibration_pending=True,
             demo_mode=(settings.DATA_MODE == "demo"),
             overall_status="AWAITING_TELEMETRY",
             operating_mode=settings.DATA_MODE,
+            water_quality_mode=config.active_mode,
             data_freshness="NO_DATA",
             last_cloud_sync=None,
         )
@@ -116,6 +129,7 @@ def get_system_status(db: Session = Depends(get_db)):
         operating_mode=settings.DATA_MODE,
         last_sync=latest.timestamp,
         is_stale=is_stale,
+        water_quality_mode=config.active_mode,
     )
 
 
@@ -322,8 +336,10 @@ def get_ml_anomalies(
             "timestamp": r.timestamp,
             "ph": r.ph,
             "turbidity": r.turbidity,
+            "tds": r.tds,
             "ph_voltage": r.ph_voltage,
             "turbidity_voltage": r.turbidity_voltage,
+            "tds_voltage": r.tds_voltage,
         }
         for r in readings_chron
     ])
@@ -375,6 +391,7 @@ def get_ml_trends(
             "timestamp": r.timestamp,
             "ph": r.ph,
             "turbidity": r.turbidity,
+            "tds": r.tds,
         }
         for r in readings
     ]
@@ -441,24 +458,20 @@ def get_chatbot_status():
 @api_router.post("/demo/inject/{scenario}", response_model=SensorReadingResponse, tags=["Demo Mode"])
 def inject_demo_scenario(scenario: str, db: Session = Depends(get_db)):
     """
-    Injects a specific scenario ('normal', 'warning', 'critical', 'sensor_fault', 'stale')
-    into the database for immediate testing of alerts, OLED banners, and ML detectors.
+    Injects a specific scenario ('normal', 'warning', 'critical', 'uncalibrated', 'sensor_fault', 'stale')
+    into the database, evaluated dynamically under the currently selected Water Quality Mode.
     """
-    reading = DemoService.generate_demo_reading(scenario=scenario)
+    try:
+        config = ModeService.get_or_create_config(db)
+        reading = DemoService.generate_demo_reading(scenario=scenario, config=config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     db.add(reading)
     db.commit()
     db.refresh(reading)
 
-    if reading.alert_severity > 0:
-        alert = AlertLogModel(
-            timestamp=reading.timestamp,
-            severity=reading.alert_severity,
-            title=reading.alert_messages,
-            message=reading.validation_notes or "Injected demo scenario event.",
-            resolved=False,
-        )
-        db.add(alert)
-        db.commit()
+    AlertService.evaluate_and_record_alerts(db, reading)
 
     return reading
 
@@ -491,16 +504,19 @@ def get_calibration_status(db: Session = Depends(get_db)):
     tds_cal = latest.tds_calibrated if latest else False
     ph_v = latest.ph_voltage if latest else 0.0
     turb_v = latest.turbidity_voltage if latest else 0.0
+    tds_v = latest.tds_voltage if latest else None
 
     return CalibrationStatusDetail(
         ph_calibrated=ph_cal,
         turbidity_calibrated=turb_cal,
         tds_calibrated=tds_cal,
-        calibration_pending=(not ph_cal or not turb_cal),
+        calibration_pending=(not ph_cal or not turb_cal or not tds_cal),
         ph_voltage=ph_v,
         turbidity_voltage=turb_v,
-        ph_reference_standards=["pH 7.00 (Neutral Reference Buffer)", "pH 4.01 (Acidic Reference Buffer)"],
-        turbidity_reference_standards=["0.0 NTU (Distilled / Deionized Water Baseline)", "100.0 NTU (Certified Reference Standard)"],
+        tds_voltage=tds_v,
+        ph_reference_standards=["pH 7.00 (Neutral Buffer)", "pH 4.01 (Acidic Buffer)"],
+        turbidity_reference_standards=["0.0 NTU (Distilled Baseline)", "100.0 NTU (Certified Standard)"],
+        tds_reference_standards=["342 mg/L (NaCl Reference)", "707 mg/L (1413 uS/cm KCl Standard)"],
         recent_records=[CalibrationRecordResponse.model_validate(r) for r in records],
     )
 
@@ -536,4 +552,43 @@ def get_calibration_records(
     if sensor_type:
         query = query.filter(CalibrationRecordModel.sensor_type == sensor_type)
     return query.order_by(CalibrationRecordModel.timestamp.desc()).limit(limit).all()
+
+
+# ==============================================================================
+# 9. DUAL WATER QUALITY MODES & THRESHOLD CONFIGURATION
+# ==============================================================================
+
+@api_router.get("/settings/mode", response_model=WaterQualitySettingsResponse, tags=["Water Quality Modes"])
+def get_water_quality_settings(db: Session = Depends(get_db)):
+    """
+    Returns active Water Quality Mode ('drinking' or 'regular_usage'), both separate
+    threshold profiles, and real-time evaluation of the latest telemetry reading.
+    """
+    return ModeService.get_settings_response(db)
+
+
+@api_router.put("/settings/mode", response_model=WaterQualitySettingsResponse, tags=["Water Quality Modes"])
+def set_water_quality_mode(req: ModeSwitchRequest, db: Session = Depends(get_db)):
+    """
+    Persists mode change ('drinking' or 'regular_usage') and immediately recalculates
+    parameter status and threshold alerts.
+    """
+    return ModeService.switch_mode(db, req.mode)
+
+
+@api_router.put("/settings/thresholds", response_model=WaterQualitySettingsResponse, tags=["Water Quality Modes"])
+def update_mode_thresholds(req: ThresholdUpdateRequest, db: Session = Depends(get_db)):
+    """
+    Updates configurable threshold bounds for a specific mode without affecting the other mode.
+    """
+    return ModeService.update_thresholds(db, req)
+
+
+@api_router.post("/settings/mode/reset/{mode}", response_model=WaterQualitySettingsResponse, tags=["Water Quality Modes"])
+def reset_mode_thresholds(mode: WaterQualityModeLiteral, db: Session = Depends(get_db)):
+    """
+    Restores default limits for the selected mode (Drinking: BIS IS 10500:2012; Regular Usage: defaults).
+    """
+    return ModeService.reset_mode_defaults(db, mode)
+
 

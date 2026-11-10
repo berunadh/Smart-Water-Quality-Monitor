@@ -8,15 +8,17 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.database.session import engine, SessionLocal
 from app.database.base import Base
+from app.database.migrations import run_safe_migrations
 from app.api.routes import api_router
 from app.services.demo_service import DemoService
+from app.services.mode_service import ModeService
 from app.ml.trainer import ModelTrainer
 
 # Ensure all models are imported before creating tables
 import app.models  # noqa: F401
 
-# Ensure SQLite schema exists upon import
-Base.metadata.create_all(bind=engine)
+# Ensure SQLite schema exists and run safe column migrations upon import
+run_safe_migrations(engine)
 
 
 @asynccontextmanager
@@ -25,17 +27,18 @@ async def lifespan(app: FastAPI):
     logger.info(f"=== Starting {settings.PROJECT_NAME} v{settings.VERSION} [{settings.ENVIRONMENT}] ===")
     logger.info(f"[Config] Operating Mode: {settings.DATA_MODE.upper()}")
     
-    # 1. Initialize Database Schema
-    Base.metadata.create_all(bind=engine)
-    logger.info("[Database] SQLite database schema initialized.")
+    # 1. Initialize & Migrate Database Schema
+    run_safe_migrations(engine)
+    logger.info("[Database] SQLite database schema initialized and migrated safely.")
 
-    # 2. Seed Demo Telemetry if in Demo Mode and Database is Empty
-    if settings.DATA_MODE == "demo":
-        db = SessionLocal()
-        try:
+    # Ensure persistent Water Quality Mode config exists
+    db = SessionLocal()
+    try:
+        ModeService.get_or_create_config(db)
+        if settings.DATA_MODE == "demo":
             DemoService.seed_demo_history(db, count=60)
-        finally:
-            db.close()
+    finally:
+        db.close()
 
     # 3. Ensure Baseline ML Model Exists
     try:

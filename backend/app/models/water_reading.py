@@ -16,11 +16,14 @@ class WaterReadingModel(Base):
     # Physical / Calibrated measurements (Nullable if uncalibrated or absent)
     ph = Column(Float, nullable=True)                  # Calibrated pH (e.g. 6.5 - 8.5)
     turbidity = Column(Float, nullable=True)           # Calibrated Turbidity in NTU
-    tds = Column(Float, nullable=True)                 # Calibrated TDS in ppm (STRICT: NULL if not installed)
+    tds = Column(Float, nullable=True)                 # Calibrated TDS in ppm (STRICT: NULL if uncalibrated)
 
-    # Sensor Board Output Voltages (Reconstructed V_board = V_ADC * 2.50)
+    # Sensor Board / ADC Voltages
+    # pH & Turbidity use 15k/10k voltage divider (reconstructed V_board = V_ADC * 2.50)
+    # TDS uses direct 3.3V ADC input (V_ADC directly, NO divider multiplier)
     ph_voltage = Column(Float, nullable=False)
     turbidity_voltage = Column(Float, nullable=False)
+    tds_voltage = Column(Float, nullable=True)
 
     # Calibration Status Flags for Each Sensor
     ph_calibrated = Column(Boolean, default=False, nullable=False)
@@ -33,9 +36,10 @@ class WaterReadingModel(Base):
     sensor_health_summary = Column(String(64), default="OPERATIONAL", nullable=False)
     alert_messages = Column(String(255), default="NORMAL", nullable=False)
 
-    # Operational Provenance & State
+    # Operational Provenance & Water Quality Evaluation Mode
     data_source = Column(String(32), default="thingspeak", nullable=False)  # "thingspeak" | "simulated" | "sensor_node"
     operating_mode = Column(String(16), default="real", nullable=False)     # "real" | "demo"
+    water_quality_mode = Column(String(32), default="drinking", nullable=False)  # "drinking" | "regular_usage"
     is_valid = Column(Boolean, default=True, nullable=False)
     is_stale = Column(Boolean, default=False, nullable=False)
     validation_notes = Column(String(255), nullable=True)

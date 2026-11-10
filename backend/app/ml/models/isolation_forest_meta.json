@@ -7,7 +7,7 @@
     "ph_voltage",
     "turbidity_voltage"
   ],
-  "trained_at": "2026-11-08T12:01:32.573527",
+  "trained_at": "2026-11-10T14:29:39.742798",
   "sample_count": 200,
   "contamination": 0.08,
   "trained_on_synthetic_data": true,

@@ -3,6 +3,7 @@ from .alert_log import AlertLogModel
 from .calibration import CalibrationRecordModel
 from .ml_anomaly import MLAnomalyRecordModel
 from .chat_message import ChatMessageModel
+from .water_quality_config import WaterQualityConfigModel
 
 __all__ = [
     "WaterReadingModel",
@@ -10,4 +11,5 @@ __all__ = [
     "CalibrationRecordModel",
     "MLAnomalyRecordModel",
     "ChatMessageModel",
+    "WaterQualityConfigModel",
 ]

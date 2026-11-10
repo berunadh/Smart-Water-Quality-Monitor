@@ -61,6 +61,7 @@ class InsightsGenerator:
                 "tds": r.tds,
                 "ph_voltage": r.ph_voltage,
                 "turbidity_voltage": r.turbidity_voltage,
+                "tds_voltage": r.tds_voltage,
                 "alert_severity": r.alert_severity,
                 "is_valid": r.is_valid,
                 "is_stale": r.is_stale,
@@ -73,16 +74,23 @@ class InsightsGenerator:
         # 1. MEASURED FACTS
         ph_str = f"{latest.ph:.2f}" if latest.ph is not None else "Uncalibrated / Pending"
         turb_str = f"{latest.turbidity:.1f} NTU" if latest.turbidity is not None else "Uncalibrated / Pending"
-        tds_str = f"{latest.tds:.0f} ppm" if latest.tds is not None else "Not Installed (Reserved)"
+        if latest.tds is not None:
+            tds_str = f"{latest.tds:.0f} mg/L"
+        elif latest.tds_voltage is not None and not latest.tds_calibrated:
+            tds_str = f"Uncalibrated (ADC {latest.tds_voltage:.3f}V)"
+        else:
+            tds_str = "Uncalibrated / Unavailable"
 
         insights.append({
             "type": "MEASURED_FACT",
+            "category": "MEASURED_FACT",
             "message": f"Latest telemetry at {latest.timestamp.strftime('%H:%M:%S UTC')}: pH = {ph_str}, Turbidity = {turb_str}, TDS = {tds_str}.",
         })
 
         if latest.is_stale:
             insights.append({
                 "type": "RULE_BASED_WARNING",
+                "category": "RULE_BASED_WARNING",
                 "message": "Telemetry stream is stale. Last transmission was more than 5 minutes ago.",
             })
 
@@ -91,6 +99,8 @@ class InsightsGenerator:
         for fault in faults:
             insights.append({
                 "type": "RULE_BASED_WARNING",
+                "category": "RULE_BASED_WARNING",
+                "parameter": fault.parameter,
                 "message": fault.human_explanation,
             })
 
@@ -99,29 +109,44 @@ class InsightsGenerator:
         if trend_resp.turbidity_drift.trend_direction == "INCREASING":
             insights.append({
                 "type": "MEASURED_FACT",
+                "category": "MEASURED_FACT",
+                "parameter": "turbidity",
                 "message": (
-                    f"Turbidity is rising at a measured rate of {trend_resp.turbidity_drift.slope_per_hour:+.2f} NTU/hour. "
-                    "Suspect minor particulate buildup or pipe disturbance."
+                    f"Turbidity is rising at a measured rate of {trend_resp.turbidity_drift.slope_per_hour:+.2f} NTU/hour."
                 ),
             })
         elif trend_resp.turbidity_drift.trend_direction == "STABLE":
             insights.append({
                 "type": "MEASURED_FACT",
-                "message": "Turbidity has remained stable over the monitored window.",
+                "category": "MEASURED_FACT",
+                "parameter": "turbidity",
+                "message": "Turbidity baseline remained stable over the monitored window.",
             })
 
-        if trend_resp.ph_drift.trend_direction != "STABLE" and trend_resp.ph_drift.trend_direction != "INSUFFICIENT_DATA":
+        if trend_resp.ph_drift.trend_direction not in ("STABLE", "INSUFFICIENT_DATA", "NO_DATA"):
             insights.append({
                 "type": "MEASURED_FACT",
+                "category": "MEASURED_FACT",
+                "parameter": "ph",
                 "message": f"pH trend is {trend_resp.ph_drift.trend_direction.lower()} ({trend_resp.ph_drift.slope_per_hour:+.3f} units/hour).",
+            })
+
+        if trend_resp.tds_drift and trend_resp.tds_drift.trend_direction not in ("STABLE", "INSUFFICIENT_DATA", "NO_DATA"):
+            insights.append({
+                "type": "MEASURED_FACT",
+                "category": "MEASURED_FACT",
+                "parameter": "tds",
+                "message": f"TDS trend is {trend_resp.tds_drift.trend_direction.lower()} ({trend_resp.tds_drift.slope_per_hour:+.1f} ppm/hour).",
             })
 
         # 4. STATISTICAL ANOMALIES
         stat_detector = RobustStatisticalDetector()
         stat_anomalies = stat_detector.predict(df)
-        for a in stat_anomalies[-3:]:  # Last 3
+        for a in stat_anomalies[-3:]:
             insights.append({
                 "type": "STATISTICAL_ANOMALY",
+                "category": "STATISTICAL_ANOMALY",
+                "parameter": a.parameter,
                 "message": a.human_explanation,
             })
 
@@ -131,8 +156,16 @@ class InsightsGenerator:
         for a in ml_anomalies[-2:]:
             insights.append({
                 "type": "ML_PREDICTION",
+                "category": "ML_PREDICTION",
+                "parameter": a.parameter,
                 "message": a.human_explanation,
             })
+
+        insights.append({
+            "type": "RULE_BASED_WARNING",
+            "category": "RULE_BASED_WARNING",
+            "message": "ML anomaly detection flags statistical deviations only; it does not certify water potability.",
+        })
 
         total_anomalies = len(faults) + len(stat_anomalies) + len(ml_anomalies)
         dominant_trend = trend_resp.turbidity_drift.trend_direction

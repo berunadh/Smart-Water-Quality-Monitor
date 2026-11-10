@@ -9,6 +9,7 @@ from app.core.logging import logger
 
 ACTIVE_GEMINI_FALLBACK_MODELS = [
     "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.8-flash",
 ]
@@ -213,6 +214,7 @@ class GeminiRESTAdapter(BaseLLMAdapter):
                     # If error is invalid API key or quota exceeded, trying another model won't help
                     if last_error in ("INVALID_API_KEY", "QUOTA_EXCEEDED"):
                         break
+                    logger.warning(f"[GeminiAdapter] Model '{model}' unavailable ({last_error}); trying fallback if available.")
 
             return None, last_error, active_model
 

@@ -293,8 +293,15 @@ public:
             postData += "&field2=" + String(turb.calibratedValue, 1);
         }
 
-        // Field 3: TDS ppm (strictly omitted / blank when uninstalled. NEVER upload 0)
-        if (tds.isValid && !isnan(tds.calibratedValue) && !isinf(tds.calibratedValue) && tds.status != STATUS_UNAVAILABLE && FEATURE_TDS_ENABLED) {
+        // Field 3: TDS ppm (strictly omitted if uncalibrated, disconnected, invalid, or NaN. NEVER raw voltage or fake 0)
+        if (FEATURE_TDS_ENABLED &&
+            tds.isValid &&
+            tds.status != STATUS_UNAVAILABLE &&
+            tds.status != STATUS_CALIBRATION_PENDING &&
+            tds.status != STATUS_DISCONNECTED &&
+            tds.status != STATUS_OVER_RANGE &&
+            !isnan(tds.calibratedValue) &&
+            !isinf(tds.calibratedValue)) {
             postData += "&field3=" + String(tds.calibratedValue, 0);
         }
 

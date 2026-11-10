@@ -51,6 +51,7 @@ void processSerialCommands();
 void printHelpMenu();
 void printDiagnostics();
 void printCalibrationStatus();
+void printModeStatus();
 
 // Calibration Bench Staging Variables
 float pendingPhV7 = 0.0f;
@@ -63,6 +64,10 @@ float pendingTurbVStd = 0.0f;
 float pendingTurbNtuStd = 0.0f;
 bool hasPendingTurbClear = false;
 bool hasPendingTurbStd = false;
+
+float pendingTdsVStd = 0.0f;
+float pendingTdsPpmStd = 0.0f;
+bool hasPendingTdsStd = false;
 
 // ----------------------------------------------------------------------------
 // Setup Entrypoint
@@ -94,14 +99,15 @@ void setup() {
     alertManager.begin();
     Serial.println(F("[SETUP] Buzzer subsystem initialized on GPIO25. Startup chirp emitted."));
 
-    // 4. Initialize Sensors
+    // 4. Initialize Sensors & Validator Mode Settings
+    sensorValidator.begin();
     phSensor.begin();
     turbSensor.begin();
     tdsSensor.begin();
-    Serial.println(F("[SETUP] pH Sensor initialized on GPIO34 (ADC1_CH6)."));
-    Serial.println(F("[SETUP] Turbidity Sensor initialized on GPIO32 (ADC1_CH4)."));
-    Serial.printf("[SETUP] TDS Sensor on GPIO35: %s\n", 
-                  tdsSensor.isAvailable() ? "ENABLED" : "RESERVED/PENDING (Disabled)");
+    Serial.println(F("[SETUP] pH Sensor initialized on GPIO34 (ADC1_CH6, ÷2.5 divider)."));
+    Serial.println(F("[SETUP] Turbidity Sensor initialized on GPIO32 (ADC1_CH4, ÷2.5 divider)."));
+    Serial.printf("[SETUP] TDS Sensor on GPIO35 (Direct 3.3V, 1.0x): %s\n", 
+                  tdsSensor.isAvailable() ? "ENABLED" : "DISABLED");
 
     // 5. Initialize Wi-Fi & Cloud Manager
     cloudManager.begin();
@@ -109,9 +115,9 @@ void setup() {
     // 6. Print Initial Electrical Safety Verification
     Serial.println(F("----------------------------------------------------------"));
     Serial.println(F("ELECTRICAL SAFETY REMINDER:"));
-    Serial.println(F("Verify with a multimeter that divider junction voltages"));
-    Serial.println(F("never exceed 3.0V at GPIO32 and GPIO34."));
-    Serial.println(F("Type 'help' in Serial Monitor for interactive calibration."));
+    Serial.println(F("Verify with a multimeter that GPIO voltages never exceed 3.0V"));
+    Serial.println(F("(GPIO32 & GPIO34 via 15k/10k dividers; GPIO35 direct 3.3V TDS)."));
+    Serial.println(F("Type 'help' in Serial Monitor for calibration & mode commands."));
     Serial.println(F("=========================================================="));
     Serial.println();
 }
@@ -130,15 +136,18 @@ void loop() {
         turbReading = turbSensor.read();
         tdsReading  = tdsSensor.read();
 
-        // Evaluate system invariants, safety, and alert severity
+        // Evaluate system invariants, safety, mode thresholds, and alert severity
         bool isWifi = cloudManager.isWifiConnected();
         bool isCloudOk = cloudManager.isCloudHealthy();
 
         sensorValidator.evaluate(phReading, turbReading, tdsReading, isWifi, isCloudOk);
     }
 
-    // 2. Update Alert Manager State Machine (Acoustic buzzer patterns)
-    alertManager.update(currentMillis, sensorValidator.getSeverity());
+    // 2. Update Alert Manager State Machine
+    // STRICT RULE: Buzzer only activates on calibrated threshold violations!
+    alertManager.update(currentMillis,
+                        sensorValidator.getThresholdSeverity(),
+                        sensorValidator.shouldSoundBuzzer());
 
     // 3. Update OLED Display Manager (Non-blocking screen refresh & rotation)
     displayManager.update(currentMillis, 
@@ -160,17 +169,23 @@ void loop() {
     if (currentMillis - lastSerialLogMillis >= 2000) {
         lastSerialLogMillis = currentMillis;
 
-        Serial.printf("[TELEMETRY] pH: %s | Turb: %s | TDS: %s | Sev: %s | Health: 0x%04X | Net: %s\n",
-                      phReading.isValid ? (String(phReading.calibratedValue, 2) + " pH").c_str() : phReading.message,
-                      turbReading.isValid ? (String(turbReading.calibratedValue, 1) + " NTU").c_str() : turbReading.message,
-                      tdsReading.isValid ? (String(tdsReading.calibratedValue, 0) + " ppm").c_str() : "N/A",
+        bool hasPh = (phReading.isValid && phReading.status != STATUS_CALIBRATION_PENDING && !isnan(phReading.calibratedValue));
+        bool hasTurb = (turbReading.isValid && turbReading.status != STATUS_CALIBRATION_PENDING && !isnan(turbReading.calibratedValue));
+        bool hasTds = (tdsReading.isValid && tdsReading.status != STATUS_CALIBRATION_PENDING && !isnan(tdsReading.calibratedValue));
+
+        Serial.printf("[TELEMETRY] Mode:%s | pH:%s | Turb:%s | TDS:%s | Sev:%s | Buzzer:%s | Health:0x%04X | Net:%s\n",
+                      sensorValidator.getModeShortTag(),
+                      hasPh ? (String(phReading.calibratedValue, 2) + "pH").c_str() : phReading.message,
+                      hasTurb ? (String(turbReading.calibratedValue, 1) + "NTU").c_str() : turbReading.message,
+                      hasTds ? (String(tdsReading.calibratedValue, 0) + "ppm").c_str() : tdsReading.message,
                       sensorValidator.getSeverityName(),
+                      sensorValidator.shouldSoundBuzzer() ? "ON" : "OFF",
                       sensorValidator.getHealthCode(),
                       cloudManager.getStatusText());
 
         // Highlight any electrical safety alarm
-        if (phReading.status == STATUS_OVER_RANGE || turbReading.status == STATUS_OVER_RANGE) {
-            Serial.println(F("[SAFETY ALARM] ELECTRICAL OVER-RANGE DETECTED! ADC > 3.05V! Check divider wiring!"));
+        if (phReading.status == STATUS_OVER_RANGE || turbReading.status == STATUS_OVER_RANGE || tdsReading.status == STATUS_OVER_RANGE) {
+            Serial.println(F("[SAFETY ALARM] ELECTRICAL OVER-RANGE DETECTED! ADC >= 3.05V! Check wiring immediately!"));
         }
     }
 
@@ -386,15 +401,93 @@ void processSerialCommands() {
         hasPendingTurbStd = false;
         Serial.println(F("[CAL-Turb] Turbidity sensor RESET. Status reverted to CALIBRATION_PENDING."));
     }
+    // --- TDS Calibration Workflow (Direct 3.3V ADC on GPIO35, NO Divider) ---
+    else if (cmd.equalsIgnoreCase("tds cal") || cmd.startsWith("tds cal ") || cmd.startsWith("tds point ")) {
+        int spaceIdx = cmd.lastIndexOf(' ');
+        float stdPpm = (spaceIdx > 0) ? cmd.substring(spaceIdx + 1).toFloat() : 0.0f;
+        if (stdPpm < 10.0f || stdPpm > 3000.0f) {
+            Serial.println(F("[CAL-TDS] Specify a known TDS standard solution (10 - 3000 ppm), e.g. 'tds cal 342' or 'tds cal 707'."));
+            return;
+        }
+
+        Serial.println();
+        Serial.printf("[CAL-TDS] === TDS REFERENCE CALIBRATION (%.0f ppm @ ~25C) ===\n", stdPpm);
+        Serial.println(F("[CAL-TDS] Submerge rinsed TDS probe into certified calibration standard solution."));
+        Serial.println(F("[CAL-TDS] Stir gently to dislodge bubbles, then hold steady. Sampling 30 readings..."));
+
+        float avgV = 0.0f, stdDev = 0.0f;
+        if (tdsSensor.acquireCalibrationReading(avgV, stdDev)) {
+            if (stdDev > 0.050f) {
+                Serial.printf("[CAL-TDS] WARNING: Voltage unstable (V_adc=%.3fV, σ=%.4fV > 0.050V). Let settle & retry.\n", avgV, stdDev);
+            } else if (avgV < 0.10f || avgV > 2.95f) {
+                Serial.printf("[CAL-TDS] ERROR: Measured ADC voltage %.3fV out of bounds (0.10V - 2.95V). Check probe immersion/3V3 wiring.\n", avgV);
+            } else {
+                float rawPoly = TDSSensor::computeRawPolynomialPpm(avgV);
+                if (rawPoly < 5.0f) {
+                    Serial.println(F("[CAL-TDS] ERROR: Unscaled polynomial reading too small for reliable calibration."));
+                } else {
+                    float candidateK = stdPpm / rawPoly;
+                    if (candidateK < 0.15f || candidateK > 5.00f) {
+                        Serial.printf("[CAL-TDS] ERROR: Derived cell constant k=%.3f outside plausible bounds (0.15 - 5.00).\n", candidateK);
+                    } else {
+                        pendingTdsVStd = avgV;
+                        pendingTdsPpmStd = stdPpm;
+                        hasPendingTdsStd = true;
+
+                        Serial.println();
+                        Serial.println(F("==================== TDS CALIBRATION PROPOSAL ===================="));
+                        Serial.printf("Standard Concentration          : %.1f ppm\n", pendingTdsPpmStd);
+                        Serial.printf("Measured ADC Voltage (GPIO35)   : %.3f V (Direct 1.0x, σ=%.4f V)\n", pendingTdsVStd, stdDev);
+                        Serial.printf("Unscaled Polynomial Output      : %.1f ppm\n", rawPoly);
+                        Serial.printf("Derived Cell Constant (kFactor) : %.4f\n", candidateK);
+                        Serial.println(F("Validation Status               : PASSED (Physically Plausible)"));
+                        Serial.println(F("=================================================================="));
+                        Serial.println(F("Type 'tds confirm' to commit to ESP32 Flash NVS, or 'tds cancel' to abort."));
+                    }
+                }
+            }
+        }
+    } else if (cmd.equalsIgnoreCase("tds confirm")) {
+        if (!hasPendingTdsStd) {
+            Serial.println(F("[CAL-TDS] No pending TDS calibration to confirm. Run 'tds cal <known_ppm>' first."));
+            return;
+        }
+        if (tdsSensor.setCalibrationFromReference(pendingTdsPpmStd, pendingTdsVStd, true)) {
+            Serial.println(F("[CAL-TDS] SUCCESS: TDS calibration COMMITTED to flash NVS."));
+            Serial.println(F("[CAL-TDS] Live calibrated TDS ppm measurements are now ACTIVE."));
+            hasPendingTdsStd = false;
+        } else {
+            Serial.println(F("[CAL-TDS] ERROR: Validation failed when saving TDS calibration."));
+        }
+    } else if (cmd.equalsIgnoreCase("tds cancel")) {
+        hasPendingTdsStd = false;
+        Serial.println(F("[CAL-TDS] Pending TDS calibration proposal canceled."));
+    } else if (cmd.equalsIgnoreCase("tds reset")) {
+        tdsSensor.resetCalibration();
+        hasPendingTdsStd = false;
+        Serial.println(F("[CAL-TDS] TDS sensor RESET. Status reverted to CALIBRATION_PENDING."));
+    }
+    // --- Dual Water Quality Mode Commands ---
+    else if (cmd.equalsIgnoreCase("mode drinking") || cmd.equalsIgnoreCase("mode drink")) {
+        sensorValidator.setMode(MODE_DRINKING, true);
+        printModeStatus();
+    } else if (cmd.equalsIgnoreCase("mode regular") || cmd.equalsIgnoreCase("mode regular_usage") || cmd.equalsIgnoreCase("mode usage")) {
+        sensorValidator.setMode(MODE_REGULAR_USAGE, true);
+        printModeStatus();
+    } else if (cmd.equalsIgnoreCase("mode") || cmd.equalsIgnoreCase("mode status")) {
+        printModeStatus();
+    }
     // --- Global Calibration Reset ---
     else if (cmd.equalsIgnoreCase("cal reset") || cmd.equalsIgnoreCase("cal_reset")) {
         phSensor.resetCalibration();
         turbSensor.resetCalibration();
+        tdsSensor.resetCalibration();
         hasPendingPhV7 = false;
         hasPendingPhV4 = false;
         hasPendingTurbClear = false;
         hasPendingTurbStd = false;
-        Serial.println(F("[CAL] ALL sensor calibrations RESET to CALIBRATION_PENDING."));
+        hasPendingTdsStd = false;
+        Serial.println(F("[CAL] ALL sensor calibrations (pH, Turbidity, TDS) RESET to CALIBRATION_PENDING."));
     } else if (cmd.startsWith("demo ")) {
         int val = cmd.substring(5).toInt();
         Serial.printf("[DEMO] Demo simulation flag command received: %d.\n", val);
@@ -406,74 +499,95 @@ void processSerialCommands() {
 void printHelpMenu() {
     Serial.println();
     Serial.println(F("================================================================================"));
-    Serial.println(F("         SMART WATER QUALITY MONITOR — BENCH CALIBRATION & CLI MENU            "));
+    Serial.println(F("         HYDROSENSE — BENCH CALIBRATION, MODE & DIAGNOSTICS CLI MENU           "));
     Serial.println(F("================================================================================"));
-    Serial.println(F(" General Diagnostics:"));
+    Serial.println(F(" General & Modes:"));
     Serial.println(F("   help / ?        : Show this interactive command menu"));
     Serial.println(F("   status          : Print real-time electrical & sensor diagnostics"));
     Serial.println(F("   net / wifi      : Print Wi-Fi & ThingSpeak telemetry network diagnostics"));
     Serial.println(F("   cal status      : Display stored calibration coefficients & pending bench points"));
+    Serial.println(F("   mode status     : Show active water quality mode and thresholds"));
+    Serial.println(F("   mode drinking   : Switch to DRINKING MODE (IS 10500: pH 6.5-8.5, <=1NTU, <=500ppm)"));
+    Serial.println(F("   mode regular    : Switch to REGULAR USAGE MODE (configurable operational settings)"));
     Serial.println();
-    Serial.println(F(" pH Sensor Calibration (2-Point Buffer Reference: pH 7.00 & pH 4.01):"));
+    Serial.println(F(" pH Sensor Calibration (GPIO34, 2-Point Buffer: pH 7.00 & pH 4.01):"));
     Serial.println(F("   ph cal 7.00     : Submerge in pH 7.00 buffer -> records stable V_pH7"));
-    Serial.println(F("   ph cal 4.01     : Rinse, dry, submerge in pH 4.01 buffer -> records V_pH4 & calculates slope"));
-    Serial.println(F("   ph confirm      : Permanently save verified pH calibration to ESP32 Flash NVS"));
-    Serial.println(F("   ph cancel       : Discard pending pH calibration points"));
-    Serial.println(F("   ph reset        : Revert pH sensor to CALIBRATION_PENDING and erase NVS"));
+    Serial.println(F("   ph cal 4.01     : Rinse, dry, submerge in pH 4.01 buffer -> records V_pH4 & slope"));
+    Serial.println(F("   ph confirm      : Save pH calibration to ESP32 Flash NVS (or 'ph cancel'/'ph reset')"));
     Serial.println();
-    Serial.println(F(" Turbidity Sensor Calibration (0 NTU Clear Baseline & Known Standard):"));
+    Serial.println(F(" Turbidity Sensor Calibration (GPIO32, 0 NTU Baseline & Known Standard):"));
     Serial.println(F("   turb cal clear  : Submerge in 0 NTU distilled water -> records V_clear baseline"));
     Serial.println(F("   turb cal <NTU>  : Submerge in known standard (e.g. 'turb cal 100') -> records V_std"));
-    Serial.println(F("   turb confirm    : Permanently save verified turbidity calibration to ESP32 Flash NVS"));
-    Serial.println(F("   turb cancel     : Discard pending turbidity calibration points"));
-    Serial.println(F("   turb reset      : Revert turbidity sensor to CALIBRATION_PENDING and erase NVS"));
+    Serial.println(F("   turb confirm    : Save turbidity calibration to ESP32 Flash NVS (or 'turb cancel'/'turb reset')"));
+    Serial.println();
+    Serial.println(F(" TDS Sensor Calibration (GPIO35, Direct 3.3V ADC, Known Standard ppm):"));
+    Serial.println(F("   tds cal <ppm>   : Submerge in known standard (e.g. 'tds cal 342') -> computes kFactor"));
+    Serial.println(F("   tds confirm     : Save TDS calibration to ESP32 Flash NVS (or 'tds cancel'/'tds reset')"));
     Serial.println();
     Serial.println(F(" Global Reset:"));
-    Serial.println(F("   cal reset       : Revert all sensors back to CALIBRATION_PENDING"));
+    Serial.println(F("   cal reset       : Revert pH, Turbidity & TDS back to CALIBRATION_PENDING"));
     Serial.println(F("================================================================================"));
+    Serial.println();
+}
+
+void printModeStatus() {
+    const ModeThresholds& th = sensorValidator.getActiveThresholds();
+    Serial.println();
+    Serial.println(F("==================== WATER QUALITY MODE STATUS ===================="));
+    Serial.printf("Active Mode         : %s\n", sensorValidator.getModeName());
+    Serial.printf("Reference Profile   : %s\n",
+                  sensorValidator.getMode() == MODE_DRINKING
+                      ? "BIS IS 10500:2012 Acceptable Limits"
+                      : "User-Configurable Non-Drinking Operational Settings");
+    Serial.printf("pH Allowed Range    : %.2f - %.2f\n", th.phMin, th.phMax);
+    Serial.printf("Turbidity Limit     : <= %.2f NTU\n", th.turbMax);
+    Serial.printf("TDS Limit           : <= %.0f ppm\n", th.tdsMax);
+    Serial.printf("Buzzer Armed State  : %s\n",
+                  sensorValidator.shouldSoundBuzzer() ? "ALARMING (Calibrated Violation)" : "SILENT (No Valid Violation)");
+    Serial.println(F("==================================================================="));
     Serial.println();
 }
 
 void printCalibrationStatus() {
     Serial.println();
     Serial.println(F("==================== SENSOR CALIBRATION STATUS ===================="));
-    Serial.println(F("--- [1] pH Sensor (E201-C on GPIO34) ---"));
+    Serial.println(F("--- [1] pH Sensor (E201-C on GPIO34, 15k/10k Divider) ---"));
     Serial.printf("Status              : %s\n", phSensor.isCalibrated() ? "TWO-POINT CALIBRATED" : "CALIBRATION PENDING");
-    Serial.printf("Current Raw Voltage : %.3f V (ADC: %.3f V)\n", phReading.reconstructedVoltage, phReading.adcVoltage);
+    Serial.printf("Current Voltage     : V_board=%.3f V | V_adc=%.3f V\n", phReading.reconstructedVoltage, phReading.adcVoltage);
     if (phSensor.isCalibrated()) {
         Serial.printf("Reference V_pH 7.00 : %.3f V\n", phSensor.getVPh7());
         Serial.printf("Reference V_pH 4.01 : %.3f V\n", phSensor.getVPh4());
-        Serial.printf("Nernstian Slope     : %.3f pH/V\n", phSensor.getSlope());
-        Serial.printf("Voltage Intercept   : %.3f\n", phSensor.getIntercept());
-    } else {
-        Serial.println(F("Stored Coefficients : None (Operating in uncalibrated mode)"));
+        Serial.printf("Nernstian Slope     : %.3f pH/V (Intercept: %.3f)\n", phSensor.getSlope(), phSensor.getIntercept());
     }
     if (hasPendingPhV7) {
-        Serial.printf("Bench Staging       : V_pH7 = %.3f V recorded", pendingPhV7);
-        if (hasPendingPhV4) {
-            Serial.printf(" | V_pH4 = %.3f V recorded -> Ready to 'ph confirm'!\n", pendingPhV4);
-        } else {
-            Serial.println(F(" | Awaiting 'ph cal 4.01'"));
-        }
+        Serial.printf("Bench Staging       : V_pH7=%.3fV%s\n", pendingPhV7,
+                      hasPendingPhV4 ? " | V_pH4 recorded -> type 'ph confirm'" : " | awaiting 'ph cal 4.01'");
     }
 
     Serial.println();
-    Serial.println(F("--- [2] Turbidity Sensor (Optical on GPIO32) ---"));
+    Serial.println(F("--- [2] Turbidity Sensor (Optical on GPIO32, 15k/10k Divider) ---"));
     Serial.printf("Status              : %s\n", turbSensor.isCalibrated() ? "CALIBRATED" : "CALIBRATION PENDING");
-    Serial.printf("Current Raw Voltage : %.3f V (ADC: %.3f V)\n", turbReading.reconstructedVoltage, turbReading.adcVoltage);
+    Serial.printf("Current Voltage     : V_board=%.3f V | V_adc=%.3f V\n", turbReading.reconstructedVoltage, turbReading.adcVoltage);
     if (turbSensor.isCalibrated()) {
-        Serial.printf("Clear Baseline (0 NTU): %.3f V\n", turbSensor.getVClear());
-        Serial.printf("Standard Voltage      : %.3f V (%.1f NTU)\n", turbSensor.getVStandard(), turbSensor.getNtuStandard());
-    } else {
-        Serial.println(F("Stored Coefficients : None (Operating in uncalibrated mode)"));
+        Serial.printf("Clear (0 NTU)       : %.3f V | Standard (%.1f NTU): %.3f V\n",
+                      turbSensor.getVClear(), turbSensor.getNtuStandard(), turbSensor.getVStandard());
     }
     if (hasPendingTurbClear) {
-        Serial.printf("Bench Staging       : V_clear = %.3f V recorded", pendingTurbVClear);
-        if (hasPendingTurbStd) {
-            Serial.printf(" | V_std = %.3f V (%.1f NTU) -> Ready to 'turb confirm'!\n", pendingTurbVStd, pendingTurbNtuStd);
-        } else {
-            Serial.println(F(" | Awaiting 'turb cal <ntu>'"));
-        }
+        Serial.printf("Bench Staging       : V_clear=%.3fV%s\n", pendingTurbVClear,
+                      hasPendingTurbStd ? " | V_std recorded -> type 'turb confirm'" : " | awaiting 'turb cal <ntu>'");
+    }
+
+    Serial.println();
+    Serial.println(F("--- [3] TDS Sensor (Direct 3.3V ADC on GPIO35, NO Divider) ---"));
+    Serial.printf("Status              : %s\n", tdsSensor.isCalibrated() ? "CALIBRATED" : "CALIBRATION PENDING");
+    Serial.printf("Current ADC Voltage : %.3f V (Direct 1.0x)\n", tdsReading.adcVoltage);
+    if (tdsSensor.isCalibrated()) {
+        Serial.printf("Calibrated kFactor  : %.4f (Ref %.0f ppm @ %.3f V)\n",
+                      tdsSensor.getKFactor(), tdsSensor.getPpmStandard(), tdsSensor.getVStandard());
+    }
+    if (hasPendingTdsStd) {
+        Serial.printf("Bench Staging       : %.1f ppm @ %.3fV recorded -> type 'tds confirm'\n",
+                      pendingTdsPpmStd, pendingTdsVStd);
     }
     Serial.println(F("==================================================================="));
     Serial.println();
@@ -482,13 +596,17 @@ void printCalibrationStatus() {
 void printDiagnostics() {
     Serial.println();
     Serial.println(F("==================== SYSTEM DIAGNOSTICS ===================="));
+    Serial.printf("Water Quality Mode        : %s\n", sensorValidator.getModeName());
     Serial.printf("pH Sensor (GPIO34)        : Raw=%0.1f | Vadc=%.3f V | Vboard=%.3f V | Status=%s\n",
                   phReading.rawAdc, phReading.adcVoltage, phReading.reconstructedVoltage, phReading.message);
     Serial.printf("Turbidity Sensor (GPIO32) : Raw=%0.1f | Vadc=%.3f V | Vboard=%.3f V | Status=%s\n",
                   turbReading.rawAdc, turbReading.adcVoltage, turbReading.reconstructedVoltage, turbReading.message);
-    Serial.printf("TDS Sensor (GPIO35)       : %s\n", 
-                  tdsReading.isValid ? (String(tdsReading.calibratedValue, 1) + " ppm").c_str() : "N/A (Pending Installation)");
-    Serial.printf("System Severity           : %s (%d)\n", sensorValidator.getSeverityName(), (int)sensorValidator.getSeverity());
+    Serial.printf("TDS Sensor (GPIO35)       : Raw=%0.1f | Vadc=%.3f V (Direct 1.0x) | Status=%s\n",
+                  tdsReading.rawAdc, tdsReading.adcVoltage, tdsReading.message);
+    Serial.printf("System Severity           : %s (%d) | Buzzer: %s\n",
+                  sensorValidator.getSeverityName(), (int)sensorValidator.getSeverity(),
+                  sensorValidator.shouldSoundBuzzer() ? "ACTIVE" : "SILENT");
+    Serial.printf("Alert Explanation         : %s\n", sensorValidator.getAlertMessage());
     Serial.printf("System Health Bitmask     : 0x%04X\n", sensorValidator.getHealthCode());
     Serial.printf("Wi-Fi Connected           : %s\n", cloudManager.isWifiConnected() ? "YES" : "NO");
     Serial.printf("Cloud Telemetry Status    : %s\n", cloudManager.getStatusText());

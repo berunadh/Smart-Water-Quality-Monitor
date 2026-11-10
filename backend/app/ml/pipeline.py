@@ -42,11 +42,20 @@ class WaterFeaturePipeline:
             features["turb_rolling_std"] = features["turbidity"].rolling(window=window_size, min_periods=1).std().fillna(0.0)
             features["turb_diff_1"] = features["turbidity"].diff().fillna(0.0)
 
+        # Rolling statistics for Calibrated TDS (preserves NaN where uncalibrated)
+        if "tds" in features.columns and features["tds"].notna().any():
+            features["tds_rolling_mean"] = features["tds"].rolling(window=window_size, min_periods=1).mean()
+            features["tds_rolling_std"] = features["tds"].rolling(window=window_size, min_periods=1).std().fillna(0.0)
+            features["tds_diff_1"] = features["tds"].diff().fillna(0.0)
+
         # Voltage stability (drift in hardware signal boards)
         if "ph_board_voltage" in features.columns:
             features["ph_v_drift"] = features["ph_board_voltage"].diff().abs().fillna(0.0)
 
         if "turbidity_board_voltage" in features.columns:
             features["turb_v_drift"] = features["turbidity_board_voltage"].diff().abs().fillna(0.0)
+
+        if "tds_voltage" in features.columns and features["tds_voltage"].notna().any():
+            features["tds_v_drift"] = features["tds_voltage"].diff().abs().fillna(0.0)
 
         return features

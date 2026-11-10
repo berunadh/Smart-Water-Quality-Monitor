@@ -11,12 +11,14 @@ import {
   BarChart3,
   Cpu,
   Layers,
+  SlidersHorizontal,
 } from 'lucide-react';
-import { BackendHealth, SystemHealth } from '../types';
+import { BackendHealth, SystemHealth, WaterQualityMode } from '../types';
 
 interface HeaderProps {
   health: BackendHealth | null;
   system: SystemHealth | null;
+  activeWaterMode: WaterQualityMode;
   activeTab: string;
   setActiveTab: (tab: string) => void;
   onRefresh: () => void;
@@ -26,6 +28,7 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   health,
   system,
+  activeWaterMode,
   activeTab,
   setActiveTab,
   onRefresh,
@@ -43,57 +46,54 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'ml', label: 'ML Insights', icon: Layers },
     { id: 'alerts', label: 'Alerts', icon: AlertTriangle },
     { id: 'chatbot', label: 'AI Advisor', icon: Bot },
+    { id: 'settings', label: 'Thresholds & Cal', icon: SlidersHorizontal },
     { id: 'diagnostics', label: 'Diagnostics', icon: Cpu },
   ];
 
   return (
-    <header className="sticky top-0 z-40 bg-white/95 backdrop-blur border-b border-slate-200 shadow-sm">
+    <header className="sticky top-0 z-40 bg-white/95 backdrop-blur border-b border-slate-200 shadow-xs">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16">
+        <div className="flex items-center justify-between h-14">
           {/* Brand Identity */}
-          <div className="flex items-center space-x-3">
-            <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-sky-600 to-cyan-500 flex items-center justify-center text-white shadow-md shadow-sky-500/20">
-              <Droplets className="h-6 w-6" />
+          <div className="flex items-center space-x-2.5">
+            <div className="h-9 w-9 rounded-lg bg-gradient-to-tr from-sky-600 to-cyan-500 flex items-center justify-center text-white shadow-xs">
+              <Droplets className="h-5 w-5" />
             </div>
-            <div>
-              <div className="flex items-center space-x-2">
-                <h1 className="text-lg font-bold text-slate-900 tracking-tight">
-                  HydroSense IoT
-                </h1>
-                <span className="text-xs px-2 py-0.5 rounded-full font-medium bg-slate-100 text-slate-600 border border-slate-200">
-                  v{health?.version || '2.0'}
-                </span>
-                {/* Operating Mode Badge */}
-                {isDemo ? (
-                  <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-amber-100 text-amber-800 border border-amber-300 animate-pulse">
-                    DEMO MODE
-                  </span>
-                ) : (
-                  <span className="text-xs px-2 py-0.5 rounded-full font-semibold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                    REAL HARDWARE
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-500 hidden sm:block">
-                Smart Apartment Water Quality & Anomaly Monitor
-              </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-base sm:text-lg font-bold text-slate-900 tracking-tight">
+                HydroSense
+              </h1>
+              <span
+                className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border ${
+                  activeWaterMode === 'drinking'
+                    ? 'bg-sky-50 text-sky-700 border-sky-200'
+                    : 'bg-teal-50 text-teal-700 border-teal-200'
+                }`}
+              >
+                {activeWaterMode === 'drinking' ? 'DRINKING MODE' : 'REGULAR USAGE'}
+              </span>
+              <span
+                className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border ${
+                  isDemo
+                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                    : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                }`}
+              >
+                {isDemo ? 'DEMO STREAM' : 'HARDWARE LIVE'}
+              </span>
             </div>
           </div>
 
-          {/* Status Indicators & Refresh */}
-          <div className="flex items-center space-x-3">
-            {/* Cloud & Live Pill */}
+          {/* Connectivity & Refresh */}
+          <div className="flex items-center space-x-2.5">
             <div className="hidden md:flex items-center space-x-2 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs">
               <span className="flex items-center space-x-1.5 text-slate-600">
                 <Cloud className="h-3.5 w-3.5 text-sky-500" />
-                <span>Cloud:</span>
                 <span className={isCloudConnected ? 'font-semibold text-emerald-600' : 'font-semibold text-amber-600'}>
-                  {health?.cloud_connectivity || 'Checking...'}
+                  {isDemo ? 'Simulated' : health?.cloud_connectivity || 'Checking'}
                 </span>
               </span>
-
               <span className="text-slate-300">|</span>
-
               <span className="flex items-center space-x-1.5">
                 {system?.wifi_connected ? (
                   <Wifi className="h-3.5 w-3.5 text-emerald-500" />
@@ -105,18 +105,17 @@ export const Header: React.FC<HeaderProps> = ({
                     isLive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-400'
                   }`}
                 />
-                <span className="text-slate-500 font-mono">
-                  {health?.data_freshness || 'SYNCING'}
+                <span className="text-slate-600 font-mono text-[11px]">
+                  {health?.data_freshness || 'SYNC'}
                 </span>
               </span>
             </div>
 
-            {/* Refresh Button */}
             <button
               onClick={onRefresh}
               disabled={isRefreshing}
-              title="Refresh all metrics from FastAPI backend"
-              className="p-2 rounded-lg text-slate-600 hover:text-sky-600 hover:bg-slate-100 transition-colors border border-slate-200 disabled:opacity-50"
+              title="Refresh telemetry"
+              className="p-1.5 rounded-lg text-slate-600 hover:text-sky-600 hover:bg-slate-100 transition-colors border border-slate-200 disabled:opacity-50"
             >
               <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin text-sky-600' : ''}`} />
             </button>
@@ -124,7 +123,7 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Navigation Tabs */}
-        <div className="flex space-x-1 overflow-x-auto py-2 -mb-px border-t border-slate-100">
+        <div className="flex space-x-1 overflow-x-auto py-1.5 -mb-px border-t border-slate-100">
           {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
@@ -132,9 +131,9 @@ export const Header: React.FC<HeaderProps> = ({
               <button
                 key={item.id}
                 onClick={() => setActiveTab(item.id)}
-                className={`flex items-center space-x-2 px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
+                className={`flex items-center space-x-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition-all whitespace-nowrap ${
                   isActive
-                    ? 'bg-sky-50 text-sky-700 shadow-sm border border-sky-200/80'
+                    ? 'bg-sky-50 text-sky-700 shadow-2xs border border-sky-200/80'
                     : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/70 border border-transparent'
                 }`}
               >

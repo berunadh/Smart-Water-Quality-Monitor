@@ -32,9 +32,9 @@
 // ----------------------------------------------------------------------------
 // 2. HARDWARE FEATURE FLAGS
 // ----------------------------------------------------------------------------
-// TDS sensor has NOT arrived. Keep strictly disabled.
-// Missing TDS must always report NULL/unavailable, NEVER 0.0.
-#define FEATURE_TDS_ENABLED   false
+// TDS sensor is now physically installed on GPIO35 (3.3V powered, no divider).
+// Uncalibrated TDS must still report NULL/NAN, NEVER 0.0 or raw voltage as ppm.
+#define FEATURE_TDS_ENABLED   true
 
 // Demo/Simulation mode: Set to true if testing on a desk without physical probes.
 // Simulates normal water values, occasional turbidity spikes, and safe voltages.
@@ -50,7 +50,7 @@
 #define ESP32_ADC_MAX_RAW           4095.0f
 #define ESP32_ADC_VREF              3.30f     // Nominal VDD reference
 
-// Voltage Divider: R1 = 15kΩ (high-side), R2 = 10kΩ (low-side to GND)
+// Voltage Divider (pH & Turbidity ONLY): R1 = 15kΩ (high-side), R2 = 10kΩ (low-side to GND)
 // V_ADC = V_sensor * (R2 / (R1 + R2)) = V_sensor * (10 / 25) = V_sensor * 0.400
 // V_sensor = V_ADC / 0.400 = V_ADC * 2.500
 #define DIVIDER_R1_OHMS             15000.0f
@@ -58,12 +58,16 @@
 #define VOLTAGE_DIVIDER_RATIO       (DIVIDER_R2_OHMS / (DIVIDER_R1_OHMS + DIVIDER_R2_OHMS)) // 0.40f
 #define VOLTAGE_RECONSTRUCT_FACTOR  (1.0f / VOLTAGE_DIVIDER_RATIO)                         // 2.50f
 
+// TDS Direct Connection (NO voltage divider: V_module == V_ADC)
+#define TDS_VOLTAGE_MULTIPLIER      1.00f
+
 // Safety & Over-Range Detection Thresholds
 // 11dB attenuation saturates around 3.1V - 3.2V.
 // Any ADC reading >= 3.05V or raw >= 4000 indicates severe electrical hazard or miswiring!
 #define ADC_OVER_RANGE_VOLTS        3.05f
 #define ADC_OVER_RANGE_RAW          4000
-#define ADC_DISCONNECTED_VOLTS      0.08f     // Floating or pulled to GND
+#define ADC_DISCONNECTED_VOLTS      0.08f     // pH/Turbidity floating or pulled to GND
+#define ADC_TDS_DISCONNECTED_VOLTS  0.015f    // TDS open-circuit or dry in air (<15 mV)
 
 // Oversampling and Filter settings
 #define ADC_OVERSAMPLE_SAMPLES      25        // Number of samples per reading
@@ -89,19 +93,45 @@
 #define BUZZER_MAX_ALARM_MS         10000     // Buzzer sounds max 10 s continuously
 
 // ----------------------------------------------------------------------------
-// 6. WATER QUALITY THRESHOLDS & HYSTERESIS (EPA / WHO STANDARDS)
+// 6. DUAL WATER QUALITY MODES & THRESHOLD PROFILES
 // ----------------------------------------------------------------------------
-// pH Safe range: 6.5 to 8.5
-#define THRESHOLD_PH_WARNING_MIN    6.50f
-#define THRESHOLD_PH_WARNING_MAX    8.50f
-#define THRESHOLD_PH_CRITICAL_MIN   5.50f
-#define THRESHOLD_PH_CRITICAL_MAX   9.50f
-#define THRESHOLD_PH_HYSTERESIS     0.15f
+enum WaterQualityMode {
+    MODE_DRINKING      = 0,  // Indian Standard IS 10500:2012 Acceptable Limits
+    MODE_REGULAR_USAGE = 1   // Configurable non-drinking operational settings
+};
 
-// Turbidity Safe range: < 5.0 NTU (Drinking guideline often < 1.0, warning > 5.0)
-#define THRESHOLD_TURB_WARNING_NTU  5.00f
-#define THRESHOLD_TURB_CRITICAL_NTU 25.00f
-#define THRESHOLD_TURB_HYSTERESIS   0.60f
+// Profile A: DRINKING MODE (BIS IS 10500:2012 Acceptable Limits)
+#define DRINKING_PH_MIN             6.50f
+#define DRINKING_PH_MAX             8.50f
+#define DRINKING_PH_CRIT_MIN        5.50f
+#define DRINKING_PH_CRIT_MAX        9.50f
+#define DRINKING_TURB_MAX_NTU       1.00f     // Strict IS 10500 acceptable limit
+#define DRINKING_TURB_CRIT_NTU      5.00f
+#define DRINKING_TDS_MAX_PPM        500.0f    // Strict IS 10500 acceptable limit
+#define DRINKING_TDS_CRIT_PPM       1000.0f
+
+// Profile B: REGULAR USAGE MODE (Provisional Configurable Operational Defaults)
+#define REGULAR_PH_MIN              6.00f
+#define REGULAR_PH_MAX              9.00f
+#define REGULAR_PH_CRIT_MIN         5.00f
+#define REGULAR_PH_CRIT_MAX         10.00f
+#define REGULAR_TURB_MAX_NTU        10.00f
+#define REGULAR_TURB_CRIT_NTU       25.00f
+#define REGULAR_TDS_MAX_PPM         1000.0f
+#define REGULAR_TDS_CRIT_PPM        2000.0f
+
+// Hysteresis Margins (prevent rapid oscillation near thresholds)
+#define THRESHOLD_PH_HYSTERESIS     0.15f
+#define THRESHOLD_TURB_HYSTERESIS   0.15f
+#define THRESHOLD_TDS_HYSTERESIS    20.0f
+
+// Compatibility aliases for sensor driver defaults
+#define THRESHOLD_PH_WARNING_MIN    DRINKING_PH_MIN
+#define THRESHOLD_PH_WARNING_MAX    DRINKING_PH_MAX
+#define THRESHOLD_PH_CRITICAL_MIN   DRINKING_PH_CRIT_MIN
+#define THRESHOLD_PH_CRITICAL_MAX   DRINKING_PH_CRIT_MAX
+#define THRESHOLD_TURB_WARNING_NTU  DRINKING_TURB_MAX_NTU
+#define THRESHOLD_TURB_CRITICAL_NTU DRINKING_TURB_CRIT_NTU
 
 // ----------------------------------------------------------------------------
 // 7. SYSTEM ENUMS AND HEALTH BITMASKS
@@ -120,6 +150,8 @@ enum AlertSeverity {
 #define HEALTH_PH_FAULT             (1 << 2)  // Bit 2: pH probe error/stuck/overrange
 #define HEALTH_TURB_FAULT           (1 << 3)  // Bit 3: Turbidity probe error
 #define HEALTH_ADC_OVER_RANGE       (1 << 4)  // Bit 4: Electrical hazard (ADC > 3.05V)
-#define HEALTH_TDS_UNAVAILABLE      (1 << 5)  // Bit 5: TDS sensor absent
-#define HEALTH_CALIBRATION_PENDING  (1 << 6)  // Bit 6: pH or Turb uncalibrated
+#define HEALTH_TDS_UNAVAILABLE      (1 << 5)  // Bit 5: TDS sensor absent/unavailable
+#define HEALTH_CALIBRATION_PENDING  (1 << 6)  // Bit 6: One or more probes uncalibrated
 #define HEALTH_DEMO_MODE_ACTIVE     (1 << 7)  // Bit 7: Demo mode simulated data
+#define HEALTH_TDS_FAULT            (1 << 8)  // Bit 8: TDS probe disconnected/stuck/overrange
+#define HEALTH_MODE_REGULAR         (1 << 9)  // Bit 9: 0=Drinking Mode, 1=Regular Usage Mode

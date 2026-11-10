@@ -1,6 +1,6 @@
-"""Tool definitions for LLM context retrieval and water domain reasoning."""
+"""Tool definitions for LLM context retrieval, dual-mode evaluation, and water domain reasoning."""
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -8,47 +8,76 @@ from sqlalchemy import func
 from app.models.water_reading import WaterReadingModel
 from app.models.alert_log import AlertLogModel
 from app.models.chat_message import ChatMessageModel
-from app.core.config import settings
-from app.ml.trend_analyzer import TrendAnalyzer
+from app.services.mode_service import ModeService
 
 
 class WaterChatbotTools:
-    """Provides structured data query tools to the AI Chatbot agent."""
+    """Provides structured telemetry, threshold, trend, and conversation query tools to the AI Chatbot."""
 
     @staticmethod
     def get_current_water_status(db: Session) -> Dict[str, Any]:
-        """Fetches the latest reading from the database."""
+        """Fetches latest reading alongside active Water Quality Mode evaluation & thresholds."""
         latest = (
             db.query(WaterReadingModel)
             .order_by(WaterReadingModel.timestamp.desc())
             .first()
         )
+        config = ModeService.get_or_create_config(db)
+        profile = ModeService.build_profile(config, "drinking" if config.active_mode == "drinking" else "regular_usage")
+        evaluation = ModeService.evaluate_reading(latest, config)
+
+        base_thresholds = {
+            "mode": config.active_mode,
+            "mode_label": profile.label,
+            "reference_note": profile.reference_note,
+            "ph_min": profile.ph_min,
+            "ph_max": profile.ph_max,
+            "turbidity_max": profile.turbidity_max,
+            "tds_max": profile.tds_max,
+            "disclaimer": evaluation.preliminary_disclaimer,
+        }
+
         if not latest:
-            return {"status": "NO_DATA", "message": "No sensor readings recorded yet."}
+            return {
+                "status": "NO_DATA",
+                "message": "No sensor readings recorded yet.",
+                "active_thresholds": base_thresholds,
+                "evaluation": evaluation.model_dump(),
+            }
+
+        age_seconds = (datetime.utcnow() - latest.timestamp).total_seconds()
+        is_stale = latest.is_stale or (age_seconds > 300)
 
         return {
+            "device_id": latest.device_id,
             "timestamp": latest.timestamp.isoformat(),
+            "age_minutes": round(age_seconds / 60.0, 1),
             "ph": latest.ph,
             "turbidity_ntu": latest.turbidity,
-            "tds_ppm": latest.tds,  # strictly null if uninstalled
+            "tds_ppm": latest.tds,
             "ph_calibrated": latest.ph_calibrated,
             "turbidity_calibrated": latest.turbidity_calibrated,
             "tds_calibrated": latest.tds_calibrated,
-            "alert_severity": latest.alert_severity,
-            "alert_message": latest.alert_messages,
+            "ph_voltage": latest.ph_voltage,
+            "turbidity_voltage": latest.turbidity_voltage,
+            "tds_voltage": latest.tds_voltage,
+            "alert_severity": evaluation.alert_severity,
+            "alert_message": "; ".join(evaluation.violated_parameters) if evaluation.violated_parameters else latest.alert_messages,
+            "violated_parameters": evaluation.violated_parameters,
+            "parameter_evaluations": {k: v.model_dump() for k, v in evaluation.parameter_evaluations.items()},
+            "overall_evaluation_status": evaluation.overall_status,
             "health_summary": latest.sensor_health_summary,
             "health_code": f"0x{latest.health_code:04X}",
             "is_valid": latest.is_valid,
-            "is_stale": latest.is_stale,
+            "is_stale": is_stale,
             "data_source": latest.data_source,
             "operating_mode": latest.operating_mode,
-            "ph_voltage": latest.ph_voltage,
-            "turbidity_voltage": latest.turbidity_voltage,
+            "active_thresholds": base_thresholds,
         }
 
     @staticmethod
     def get_historical_metrics(db: Session, hours: int = 24) -> Dict[str, Any]:
-        """Calculates 24-hour summary statistics from SQLite."""
+        """Calculates timeframe summary statistics from SQLite including calibrated TDS."""
         cutoff = datetime.utcnow() - timedelta(hours=hours)
         count = (
             db.query(func.count(WaterReadingModel.id))
@@ -57,7 +86,7 @@ class WaterChatbotTools:
         )
 
         if count == 0:
-            return {"count": 0, "status": "NO_RECENT_DATA"}
+            return {"total_samples": 0, "status": "NO_RECENT_DATA"}
 
         stats = (
             db.query(
@@ -66,6 +95,9 @@ class WaterChatbotTools:
                 func.max(WaterReadingModel.ph),
                 func.avg(WaterReadingModel.turbidity),
                 func.max(WaterReadingModel.turbidity),
+                func.avg(WaterReadingModel.tds),
+                func.min(WaterReadingModel.tds),
+                func.max(WaterReadingModel.tds),
             )
             .filter(WaterReadingModel.timestamp >= cutoff, WaterReadingModel.is_valid == True)
             .first()
@@ -79,6 +111,9 @@ class WaterChatbotTools:
             "ph_max": round(stats[2], 2) if stats and stats[2] is not None else None,
             "turbidity_average": round(stats[3], 2) if stats and stats[3] is not None else None,
             "turbidity_max": round(stats[4], 2) if stats and stats[4] is not None else None,
+            "tds_average": round(stats[5], 1) if stats and stats[5] is not None else None,
+            "tds_min": round(stats[6], 1) if stats and stats[6] is not None else None,
+            "tds_max": round(stats[7], 1) if stats and stats[7] is not None else None,
         }
 
     @staticmethod
@@ -102,52 +137,42 @@ class WaterChatbotTools:
         ]
 
     @staticmethod
-    def explain_parameter_standards(parameter: str) -> Dict[str, Any]:
-        """Explains safe water thresholds based on EPA and WHO standards."""
+    def explain_parameter_standards(parameter: str, mode: str = "drinking") -> Dict[str, Any]:
+        """Explains water quality thresholds based on BIS IS 10500:2012 (Drinking) or Regular Usage."""
         param = parameter.lower().strip()
         if "ph" in param:
             return {
                 "parameter": "pH",
-                "safe_range": f"{settings.THRESHOLD_PH_MIN} to {settings.THRESHOLD_PH_MAX}",
-                "unit": "pH scale (0-14)",
-                "standards": "EPA National Secondary Drinking Water Regulations (6.5 to 8.5)",
-                "health_implications": (
-                    "Water with a low pH (<6.5) is acidic, soft, and corrosive, which can leach toxic "
-                    "metal ions (lead, copper) from residential apartment plumbing fixtures. "
-                    "Water with high pH (>8.5) is alkaline, producing bitter taste and mineral scale incrustation."
+                "drinking_limit": "6.5 to 8.5 (BIS IS 10500:2012 Acceptable Limit)",
+                "unit": "pH scale (0–14)",
+                "implications": (
+                    "Low pH (<6.5) is acidic and corrosive to plumbing, risking metal leaching; "
+                    "high pH (>8.5) causes bitter taste and scale formation."
                 ),
             }
         elif "turb" in param or "cloud" in param:
             return {
                 "parameter": "Turbidity",
-                "safe_limit": f"Below {settings.THRESHOLD_TURBIDITY_NTU_MAX} NTU",
-                "unit": "Nephelometric Turbidity Units (NTU)",
-                "standards": "WHO Drinking Water Guidelines (<5.0 NTU; ideally <1.0 NTU)",
-                "health_implications": (
-                    "Turbidity measures cloudiness caused by suspended colloids, clay, silt, or rust. "
-                    "While not a direct toxin, high turbidity shields pathogenic microorganisms from UV/chlorine "
-                    "disinfection and promotes bacterial regrowth in building storage tanks."
+                "drinking_limit": "≤ 1.0 NTU (BIS IS 10500:2012 Acceptable Limit)",
+                "unit": "NTU",
+                "implications": (
+                    "Suspended particulates scatter light and shield pathogens from disinfection."
                 ),
             }
-        elif "tds" in param:
+        elif "tds" in param or "dissolved" in param:
             return {
                 "parameter": "Total Dissolved Solids (TDS)",
-                "safe_limit": f"Below {settings.THRESHOLD_TDS_PPM_MAX} ppm",
-                "unit": "parts per million (ppm) / mg/L",
-                "standards": "EPA Secondary Standards (<500 ppm)",
-                "health_implications": (
-                    "Measures combined inorganic salts (calcium, magnesium, chlorides, sulfates). "
-                    "In this Phase 1/Phase 2 monitor, the TDS sensor is reserved for future hardware installation."
+                "drinking_limit": "≤ 500 mg/L (ppm) (BIS IS 10500:2012 Acceptable Limit)",
+                "unit": "mg/L (ppm)",
+                "implications": (
+                    "Measures total dissolved inorganic salts via electrical conductivity on GPIO35 (direct 3.3V)."
                 ),
             }
-        else:
-            return {
-                "error": f"Unknown parameter '{parameter}'. Supported parameters: pH, Turbidity, TDS."
-            }
+        return {"error": f"Unknown parameter '{parameter}'. Supported: pH, Turbidity, TDS."}
 
     @staticmethod
     def get_recent_conversation_history(db: Session, session_id: str, limit: int = 6) -> List[Dict[str, str]]:
-        """Retrieves the recent conversation messages for the current session."""
+        """Retrieves recent conversation messages for context-aware follow-ups."""
         try:
             messages = (
                 db.query(ChatMessageModel)
@@ -156,10 +181,6 @@ class WaterChatbotTools:
                 .limit(limit)
                 .all()
             )
-            # Return in chronological order
-            return [
-                {"role": m.role, "content": m.content}
-                for m in reversed(messages)
-            ]
+            return [{"role": m.role, "content": m.content} for m in reversed(messages)]
         except Exception:
             return []

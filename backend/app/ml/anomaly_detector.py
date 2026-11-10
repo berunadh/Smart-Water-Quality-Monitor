@@ -47,7 +47,7 @@ class RobustStatisticalDetector(BaseAnomalyDetector):
 
         anomalies: List[AnomalyItem] = []
 
-        for col in ["ph", "turbidity"]:
+        for col in ["ph", "turbidity", "tds"]:
             if col not in data.columns:
                 continue
 
@@ -76,8 +76,10 @@ class RobustStatisticalDetector(BaseAnomalyDetector):
 
                 if col == "ph":
                     desc = f"pH level ({val:.2f}) diverged significantly from moving median ({median:.2f}) by {score:.1f}σ."
-                else:
+                elif col == "turbidity":
                     desc = f"Turbidity reading ({val:.1f} NTU) spiked sharply above moving median ({median:.1f} NTU) by {score:.1f}σ."
+                else:
+                    desc = f"TDS reading ({val:.0f} mg/L) diverged sharply from moving median ({median:.0f} mg/L) by {score:.1f}σ."
 
                 anomalies.append(
                     AnomalyItem(

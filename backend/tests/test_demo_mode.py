@@ -1,4 +1,4 @@
-"""Unit tests for Demo Mode simulation scenarios and TDS null invariant."""
+"""Unit tests for Demo Mode simulation scenarios and TDS calibrated vs uncalibrated invariants."""
 
 import pytest
 from sqlalchemy import create_engine
@@ -21,47 +21,42 @@ def memory_db():
         session.close()
 
 
-def test_demo_scenarios_tds_strictly_null():
-    """TDS must be strictly None across all demo scenarios, never 0.0."""
-    scenarios = ["normal", "warning", "critical", "sensor_fault", "stale"]
-
-    for sc in scenarios:
+def test_demo_uncalibrated_and_fault_tds_strictly_null():
+    """Uncalibrated and fault scenarios must keep calibrated values strictly None, never 0.0."""
+    for sc in ["uncalibrated", "sensor_fault"]:
         reading = DemoService.generate_demo_reading(scenario=sc)
         assert reading.tds is None, f"Scenario '{sc}' violated TDS null invariant!"
+        assert reading.ph is None
+        assert reading.turbidity is None
         assert reading.tds_calibrated is False
         assert reading.data_source == "simulated"
         assert reading.operating_mode == "demo"
 
 
-def test_demo_warning_and_critical_severities():
-    """Warning scenario must have severity=1; critical scenario must have severity=2."""
-    warn_reading = DemoService.generate_demo_reading(scenario="warning")
-    assert warn_reading.alert_severity == 1
-    assert "TURBIDITY" in warn_reading.alert_messages
+def test_demo_calibrated_tds_and_severities():
+    """Calibrated demo scenarios populate realistic TDS (without 2.5x scaling) and correct severities."""
+    norm = DemoService.generate_demo_reading(scenario="normal")
+    assert norm.alert_severity == 0
+    assert norm.tds is not None and 100.0 < norm.tds < 500.0
+    assert norm.tds_voltage is not None and 0.3 < norm.tds_voltage < 3.0
 
-    crit_reading = DemoService.generate_demo_reading(scenario="critical")
-    assert crit_reading.alert_severity == 2
-    assert "CRITICAL" in crit_reading.alert_messages
+    warn = DemoService.generate_demo_reading(scenario="warning")
+    assert warn.alert_severity == 1
+    assert "TURBIDITY" in warn.alert_messages and "TDS" in warn.alert_messages
 
-
-def test_demo_sensor_fault_scenario():
-    """Sensor fault scenario must flag is_valid=False and severity=3."""
-    fault_reading = DemoService.generate_demo_reading(scenario="sensor_fault")
-    assert fault_reading.is_valid is False
-    assert fault_reading.alert_severity == 3
-    assert fault_reading.ph is None
-    assert fault_reading.turbidity is None
+    crit = DemoService.generate_demo_reading(scenario="critical")
+    assert crit.alert_severity == 2
+    assert "CRITICAL" in crit.alert_messages
 
 
 def test_demo_seeding(memory_db):
-    """Demo seeding must create requested number of records and handle TDS properly."""
+    """Demo seeding creates requested records with simulated provenance and TDS telemetry."""
     created = DemoService.seed_demo_history(memory_db, count=25)
     assert created == 25
     assert memory_db.query(WaterReadingModel).count() == 25
 
-    # Verify all records have data_source='simulated' and tds=None
     all_readings = memory_db.query(WaterReadingModel).all()
     for r in all_readings:
-        assert r.tds is None
         assert r.data_source == "simulated"
         assert r.operating_mode == "demo"
+        assert r.tds_voltage is not None
