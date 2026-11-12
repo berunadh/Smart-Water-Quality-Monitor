@@ -3,184 +3,297 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "SensorBase.h"
+#include "PHSensorLogic.h"
 
 /**
  * ============================================================================
- * pH SENSOR DRIVER (E201-C ELECTRODE + GREEN SIGNAL CONDITIONING BOARD)
+ * pH SENSOR DRIVER (E201-C ELECTRODE + SIGNAL CONDITIONING BOARD)
  * ============================================================================
  * Pin: GPIO34 (ADC1_CH6 - Input Only)
  * Circuit: P pin -> 15kΩ -> GPIO34 -> 10kΩ -> GND
  * Reconstructed V_board = V_ADC * 2.500
- * 
- * Calibration Mathematics:
- * - Two-Point Buffer Reference: pH 7.00 (neutral) and pH 4.01 (acidic)
- * - Nernstian slope equation:
- *     ΔV = V_pH7 - V_pH4
- *     Slope m = (7.00 - 4.01) / ΔV = 2.99 / (V_pH7 - V_pH4)
- *     Intercept b = 7.00 - (m * V_pH7)
- *     pH(V) = m * V + b
- * 
- * Physical Validation Rules:
- * - V_pH7 and V_pH4 must be within physical range (0.1V to 4.95V)
- * - Minimum separation |V_pH7 - V_pH4| >= 0.15V
- * - Slope |m| between 0.50 and 12.00 pH/V
- * - Measurement stability standard deviation σ < 0.05V
- * - Persistent storage in ESP32 Flash NVS via Preferences API
- * - Never fabricates calibration coefficients; defaults to STATUS_CALIBRATION_PENDING
+ *
+ * Three-Point Calibration Mathematics (pH 4.01, pH 7.00, pH 9.18):
+ *   acidSlope = (7.00 - 4.01) / (PH_CAL_7_MV - PH_CAL_4_MV)
+ *   baseSlope = (9.18 - 7.00) / (PH_CAL_9_MV - PH_CAL_7_MV)
+ *   Transition point: pH 7.00 (PH_CAL_7_MV)
+ *
+ * - Distinguishes ADC pin millivolts vs reconstructed sensor-board millivolts.
+ * - Validates slope direction (monotonicity) and magnitude.
+ * - Rejects extrapolation outside verified calibration range [4.01, 9.18].
+ * - Preserves existing valid ESP32 NVS records in namespace 'watersens'.
  * ============================================================================
  */
 
 class PHSensor : public SensorBase {
 public:
-    PHSensor(uint8_t pin = PIN_PH_ADC) 
-        : _pin(pin), 
+    PHSensor(uint8_t pin = PIN_PH_ADC)
+        : _pin(pin),
           _isCalibrated(false),
+          _isProvisional(false),
+          _isThreePoint(false),
           _vPh7(0.0f),
           _vPh4(0.0f),
+          _vPh9(0.0f),
           _slope(0.0f),
           _intercept(0.0f),
           _stuckCounter(0),
-          _lastVoltage(-1.0f) {}
+          _lastVoltage(-1.0f) {
+        memset(&_threePtCal, 0, sizeof(_threePtCal));
+        _threePtCal.isValid = false;
+        snprintf(_nvsDiag, sizeof(_nvsDiag), "Not checked yet");
+    }
 
     void begin() override {
         pinMode(_pin, INPUT);
-        loadCalibration();
+        loadOrApplyFinalCalibration();
     }
 
-    bool isAvailable() const override {
-        return true;
-    }
-
-    bool isCalibrated() const override {
-        return _isCalibrated;
-    }
+    bool isAvailable() const override { return true; }
+    // True ONLY when experimentally verified via NVS/buffers (provisional config.h estimates return false)
+    bool isCalibrated() const override { return _isCalibrated && !_isProvisional; }
+    bool isProvisional() const { return _isCalibrated && _isProvisional; }
+    bool hasCalibrationModel() const { return _isCalibrated; }
+    bool isThreePoint() const { return _isThreePoint; }
 
     float getVPh7() const { return _vPh7; }
     float getVPh4() const { return _vPh4; }
+    float getVPh9() const { return _vPh9; }
     float getSlope() const { return _slope; }
+    float getAcidSlope() const { return _isThreePoint ? _threePtCal.acidSlope : (_slope / 1000.0f); }
+    float getBaseSlope() const { return _isThreePoint ? _threePtCal.baseSlope : (_slope / 1000.0f); }
     float getIntercept() const { return _intercept; }
+    const PhThreePointCal& getThreePointCal() const { return _threePtCal; }
+    const char* getNvsDiagnostic() const { return _nvsDiag; }
 
-    /**
-     * Samples the probe stably over a series of readings and returns average voltage
-     * and standard deviation for calibration validation.
-     */
-    bool acquireCalibrationReading(float& avgVoltage, float& stdDev) {
-        return sampleStableVoltage(_pin, 30, 80, avgVoltage, stdDev);
+    bool acquireCalibrationSample(
+        float& outRawAdc,
+        float& outAdcMv,
+        float& outBoardMv,
+        float& outStdDevAdcMv,
+        float& outStdDevBoardMv
+    ) {
+        return sampleStableChannelMilliVolts(
+            _pin, 30, 80, VOLTAGE_RECONSTRUCT_FACTOR,
+            outRawAdc, outAdcMv, outBoardMv, outStdDevAdcMv, outStdDevBoardMv
+        );
     }
 
     /**
-     * Sets two-point calibration using measured sensor board voltages
-     * in standard buffer solutions (pH 7.00 and pH 4.01) at 25°C.
-     * 
-     * Validates physical plausibility before saving to non-volatile storage.
+     * Applies 3-point calibration (in mV) and optionally persists to NVS
+     * without overwriting identical existing records.
+     * When provisional == true, keeps NVS untouched until physical buffer confirmation.
      */
-    bool setCalibration(float vBoardPh7, float vBoardPh4, bool saveToNvs = true) {
-        // 1. Boundary checks: Voltages must be positive and within physical circuit limits
-        if (vBoardPh7 < 0.10f || vBoardPh7 > 4.95f || vBoardPh4 < 0.10f || vBoardPh4 > 4.95f) {
-            Serial.printf("[CAL] ERROR: Measured voltages out of electrical bounds (V7=%.3fV, V4=%.3fV).\n", 
-                          vBoardPh7, vBoardPh4);
+    bool setThreePointCalibration(
+        float v4Mv,
+        float v7Mv,
+        float v9Mv,
+        bool isBoardMv = PH_CAL_IS_BOARD_MV,
+        bool saveToNvs = true,
+        bool provisional = false
+    ) {
+        PhThreePointCal cal = buildPhThreePointCalibration(v4Mv, v7Mv, v9Mv, isBoardMv);
+        if (!cal.isValid) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "3-point pH constants invalid or non-monotonic");
+            Serial.printf("[CAL-pH] ERROR: Invalid 3-point voltages (V4=%.1fmV, V7=%.1fmV, V9=%.1fmV, board=%d)\n",
+                          v4Mv, v7Mv, v9Mv, isBoardMv ? 1 : 0);
             return false;
         }
 
-        // 2. Minimum voltage separation check (|V7 - V4| >= 0.15V)
-        float deltaV = vBoardPh7 - vBoardPh4;
-        if (abs(deltaV) < 0.15f) {
-            Serial.printf("[CAL] ERROR: Insufficient voltage separation between pH 7.00 and pH 4.01 (|ΔV|=%.3fV < 0.15V).\n", 
-                          abs(deltaV));
-            return false;
-        }
-
-        // 3. Compute slope and intercept
-        float slope = (7.00f - 4.01f) / deltaV;
-        float intercept = 7.00f - (slope * vBoardPh7);
-
-        // 4. Physical slope plausibility check (magnitude between 0.50 and 12.00 pH/V)
-        if (abs(slope) < 0.50f || abs(slope) > 12.00f) {
-            Serial.printf("[CAL] ERROR: Calculated slope %.3f pH/V is outside plausible physical range (0.5 to 12.0).\n", 
-                          slope);
-            return false;
-        }
-
-        _vPh7 = vBoardPh7;
-        _vPh4 = vBoardPh4;
-        _slope = slope;
-        _intercept = intercept;
+        _threePtCal = cal;
+        _isThreePoint = true;
         _isCalibrated = true;
+        _isProvisional = provisional;
+        _vPh4 = v4Mv / 1000.0f;
+        _vPh7 = v7Mv / 1000.0f;
+        _vPh9 = v9Mv / 1000.0f;
+        _slope = cal.acidSlope * 1000.0f;
+        _intercept = 7.00f - (_slope * _vPh7);
+
+        if (provisional) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "PROVISIONAL RAM curve (V4=%.0f V7=%.0f V9=%.0f mV); NVS untouched",
+                     v4Mv, v7Mv, v9Mv);
+            Serial.printf("[CAL-pH] Loaded PROVISIONAL config estimate in RAM: %s\n", _nvsDiag);
+            return true;
+        }
 
         if (saveToNvs) {
-            saveCalibration();
+            return saveCalibration();
         }
-
         return true;
     }
 
-    /**
-     * Safely resets calibration in memory and NVS back to uncalibrated pending state.
-     */
+    bool saveCalibration() {
+        if (_isProvisional) {
+            return false;
+        }
+        return saveThreePointIfChanged();
+    }
+
     void resetCalibration() {
         _isCalibrated = false;
+        _isProvisional = false;
+        _isThreePoint = false;
         _vPh7 = 0.0f;
         _vPh4 = 0.0f;
+        _vPh9 = 0.0f;
         _slope = 0.0f;
         _intercept = 0.0f;
+        memset(&_threePtCal, 0, sizeof(_threePtCal));
+        _threePtCal.isValid = false;
 
         Preferences prefs;
         if (prefs.begin("watersens", false)) {
             prefs.remove("ph_cal");
+            prefs.remove("ph_3pt");
+            prefs.remove("ph_bmv");
+            prefs.remove("ph_v4_mv");
+            prefs.remove("ph_v7_mv");
+            prefs.remove("ph_v9_mv");
+            prefs.remove("ph_acid_sl");
+            prefs.remove("ph_base_sl");
             prefs.remove("ph_v7");
             prefs.remove("ph_v4");
             prefs.remove("ph_slope");
             prefs.remove("ph_inter");
             prefs.end();
-            Serial.println(F("[CAL] pH calibration erased from NVS. Sensor reset to CALIBRATION_PENDING."));
         }
+        snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' OK; pH calibration reset");
     }
 
     /**
-     * Loads saved calibration coefficients from ESP32 non-volatile storage.
+     * Checks NVS FIRST so user-saved calibration is NEVER overwritten by config.h;
+     * falls back to config.h constants only if NVS has no valid pH calibration.
      */
+    void loadOrApplyFinalCalibration() {
+        loadCalibration();
+        if (_isCalibrated && !_isProvisional) {
+            return;
+        }
+
+        bool configSupplied = !isnan((float)PH_CAL_4_MV) &&
+                              !isnan((float)PH_CAL_7_MV) &&
+                              !isnan((float)PH_CAL_9_MV);
+
+        if (configSupplied) {
+            setThreePointCalibration(
+                (float)PH_CAL_4_MV,
+                (float)PH_CAL_7_MV,
+                (float)PH_CAL_9_MV,
+                PH_CAL_IS_BOARD_MV,
+                !PH_CAL_IS_PROVISIONAL,
+                PH_CAL_IS_PROVISIONAL
+            );
+        }
+    }
+
     void loadCalibration() {
         Preferences prefs;
-        if (prefs.begin("watersens", true)) { // Read-only mode
-            bool cal = prefs.getBool("ph_cal", false);
-            if (cal) {
-                float v7 = prefs.getFloat("ph_v7", 0.0f);
-                float v4 = prefs.getFloat("ph_v4", 0.0f);
-                float sl = prefs.getFloat("ph_slope", 0.0f);
-                float in = prefs.getFloat("ph_inter", 0.0f);
-
-                if (v7 > 0.1f && v4 > 0.1f && abs(sl) >= 0.50f && abs(sl) <= 12.00f) {
-                    _vPh7 = v7;
-                    _vPh4 = v4;
-                    _slope = sl;
-                    _intercept = in;
-                    _isCalibrated = true;
-                    Serial.printf("[CAL] Loaded pH calibration from NVS: V7=%.3fV, V4=%.3fV, Slope=%.3f pH/V, Intercept=%.3f\n",
-                                  _vPh7, _vPh4, _slope, _intercept);
-                } else {
-                    _isCalibrated = false;
-                }
+        if (!prefs.begin("watersens", true)) {
+            // Initialize namespace non-destructively in RW mode so future opens succeed
+            if (prefs.begin("watersens", false)) {
+                prefs.end();
+                snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' initialized; awaiting PH_CAL_4/7/9_MV");
             } else {
-                _isCalibrated = false;
+                snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' NVS open FAILED");
             }
+            _isCalibrated = false;
+            _isThreePoint = false;
+            Serial.printf("[CAL-NVS] pH: %s\n", _nvsDiag);
+            return;
+        }
+
+        // 1. Check 3-point NVS record first
+        if (prefs.getBool("ph_3pt", false)) {
+            float v4 = prefs.getFloat("ph_v4_mv", NAN);
+            float v7 = prefs.getFloat("ph_v7_mv", NAN);
+            float v9 = prefs.getFloat("ph_v9_mv", NAN);
+            bool bmv = prefs.getBool("ph_bmv", true);
             prefs.end();
+
+            PhThreePointCal cal = buildPhThreePointCalibration(v4, v7, v9, bmv);
+            if (cal.isValid) {
+                _threePtCal = cal;
+                _isThreePoint = true;
+                _isCalibrated = true;
+                _isProvisional = false;
+                _vPh4 = v4 / 1000.0f;
+                _vPh7 = v7 / 1000.0f;
+                _vPh9 = v9 / 1000.0f;
+                _slope = cal.acidSlope * 1000.0f;
+                _intercept = 7.00f - (_slope * _vPh7);
+                snprintf(_nvsDiag, sizeof(_nvsDiag),
+                         "Namespace 'watersens' OK; 3pt VALID (acid=%.5f base=%.5f pH/mV)",
+                         cal.acidSlope, cal.baseSlope);
+                Serial.printf("[CAL] Loaded 3-point pH calibration from NVS: %s\n", _nvsDiag);
+                return;
+            }
+            // Fall through to check legacy 2-point record if 3-point record was corrupt
+            if (!prefs.begin("watersens", true)) {
+                _isCalibrated = false;
+                return;
+            }
+        }
+
+        // 2. Preserve existing valid legacy 2-point NVS record if present
+        bool hasKey = prefs.isKey("ph_cal");
+        bool cal = hasKey ? prefs.getBool("ph_cal", false) : false;
+        if (!hasKey || !cal) {
+            _isCalibrated = false;
+            _isThreePoint = false;
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; %s (awaiting PH_CAL_4/7/9_MV)",
+                     hasKey ? "ph_cal=false" : "no ph_cal key");
+            Serial.printf("[CAL-NVS] pH: %s\n", _nvsDiag);
+            prefs.end();
+            return;
+        }
+
+        bool hasV7 = prefs.isKey("ph_v7");
+        bool hasV4 = prefs.isKey("ph_v4");
+        bool hasSl = prefs.isKey("ph_slope");
+        bool hasIn = prefs.isKey("ph_inter");
+        float v7 = prefs.getFloat("ph_v7", 0.0f);
+        float v4 = prefs.getFloat("ph_v4", 0.0f);
+        float sl = prefs.getFloat("ph_slope", 0.0f);
+        float in = prefs.getFloat("ph_inter", 0.0f);
+        prefs.end();
+
+        if (hasV7 && hasV4 && hasSl && hasIn &&
+            !isnan(v7) && !isnan(v4) && !isnan(sl) && !isnan(in) &&
+            v7 > 0.1f && v4 > 0.1f && fabsf(sl) >= 0.50f && fabsf(sl) <= 12.00f) {
+            _vPh7 = v7;
+            _vPh4 = v4;
+            _slope = sl;
+            _intercept = in;
+            _isCalibrated = true;
+            _isProvisional = false;
+            _isThreePoint = false;
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; legacy 2pt VALID (V7=%.3fV V4=%.3fV Slope=%.3f)",
+                     _vPh7, _vPh4, _slope);
+            Serial.printf("[CAL] Loaded legacy pH calibration from NVS: %s\n", _nvsDiag);
+        } else {
+            _isCalibrated = false;
+            _isThreePoint = false;
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' OK; NVS pH keys invalid");
+            Serial.printf("[CAL-NVS] pH: %s\n", _nvsDiag);
         }
     }
 
-    /**
-     * Commits valid calibration parameters to ESP32 flash partition.
-     */
-    void saveCalibration() {
+    bool verifyNvsReadback() const {
+        if (!_isThreePoint || !_threePtCal.isValid) return false;
         Preferences prefs;
-        if (prefs.begin("watersens", false)) { // Read-write mode
-            prefs.putBool("ph_cal", true);
-            prefs.putFloat("ph_v7", _vPh7);
-            prefs.putFloat("ph_v4", _vPh4);
-            prefs.putFloat("ph_slope", _slope);
-            prefs.putFloat("ph_inter", _intercept);
-            prefs.end();
-            Serial.println(F("[CAL] pH calibration successfully stored in persistent flash NVS."));
-        }
+        if (!prefs.begin("watersens", true)) return false;
+        bool ok = prefs.getBool("ph_3pt", false) &&
+                  fabsf(prefs.getFloat("ph_v4_mv", -1.0f) - _threePtCal.v4Mv) < 0.01f &&
+                  fabsf(prefs.getFloat("ph_v7_mv", -1.0f) - _threePtCal.v7Mv) < 0.01f &&
+                  fabsf(prefs.getFloat("ph_v9_mv", -1.0f) - _threePtCal.v9Mv) < 0.01f &&
+                  fabsf(prefs.getFloat("ph_acid_sl", 0.0f) - _threePtCal.acidSlope) < 1e-6f &&
+                  fabsf(prefs.getFloat("ph_base_sl", 0.0f) - _threePtCal.baseSlope) < 1e-6f;
+        prefs.end();
+        return ok;
     }
 
     SensorReading read() override {
@@ -188,21 +301,9 @@ public:
         memset(&reading, 0, sizeof(reading));
         reading.calibratedValue = NAN;
 
-        // In Demo Mode, simulate clean municipal tap water (pH ~7.28, board ~2.5V, ADC ~1.0V)
-        if (FEATURE_DEMO_MODE) {
-            reading.rawAdc = 1240.0f + (float)(random(-15, 16));
-            reading.adcVoltage = rawToAdcVoltage(reading.rawAdc);
-            reading.reconstructedVoltage = adcToReconstructedVoltage(reading.adcVoltage);
-            reading.calibratedValue = 7.28f + ((reading.rawAdc - 1240.0f) * 0.005f);
-            reading.status = STATUS_OK;
-            reading.isValid = true;
-            snprintf(reading.message, sizeof(reading.message), "DEMO (NORMAL)");
-            return reading;
-        }
-
-        // 1. Oversample ADC with trimmed mean
-        reading.rawAdc = sampleAdcTrimmed(_pin, ADC_OVERSAMPLE_SAMPLES, ADC_SAMPLE_DELAY_MS);
-        reading.adcVoltage = rawToAdcVoltage(reading.rawAdc);
+        // 1. Oversample ADC with factory-calibrated mV + 2.5x divider reconstruction
+        sampleChannelTrimmedMilliVolts(_pin, ADC_OVERSAMPLE_SAMPLES, ADC_SAMPLE_DELAY_MS,
+                                       reading.rawAdc, reading.adcVoltage);
         reading.reconstructedVoltage = adcToReconstructedVoltage(reading.adcVoltage);
 
         // 2. Electrical Over-Range Safety Check
@@ -214,64 +315,94 @@ public:
             return reading;
         }
 
-        // 3. Disconnected / Open-Circuit Check
-        if (reading.adcVoltage < ADC_DISCONNECTED_VOLTS) {
+        // 3. Disconnected / Open-Circuit Check (guards against ESP32 0-count ~140mV mV intercept)
+        if (reading.rawAdc < ADC_DISCONNECTED_RAW || reading.adcVoltage < ADC_DISCONNECTED_VOLTS) {
             reading.status = STATUS_DISCONNECTED;
             reading.isValid = false;
             reading.calibratedValue = NAN;
-            snprintf(reading.message, sizeof(reading.message), "DISCONNECTED/GND");
+            snprintf(reading.message, sizeof(reading.message), "DISCONNECTED/0V");
             return reading;
         }
 
-        // 4. Stuck reading detection (checks if ADC has zero natural jitter over successive reads)
-        if (_lastVoltage > 0.0f && abs(reading.adcVoltage - _lastVoltage) < 0.0005f) {
-            _stuckCounter++;
-            if (_stuckCounter > 15) {
-                reading.status = STATUS_STUCK;
-                reading.isValid = false;
-                reading.calibratedValue = NAN;
-                snprintf(reading.message, sizeof(reading.message), "STUCK READING");
-                return reading;
-            }
-        } else {
-            _stuckCounter = 0;
-            _lastVoltage = reading.adcVoltage;
+        // A stable pH voltage is normal. This is disabled by default so it
+        // cannot turn the measured 4-19mV sample variation into a false fault.
+        if (isStableVoltageFault(reading.adcVoltage, _lastVoltage, _stuckCounter)) {
+            reading.status = STATUS_STUCK;
+            reading.isValid = false;
+            snprintf(reading.message, sizeof(reading.message), "STUCK READING");
+            return reading;
         }
 
-        // 5. Calibration check: If uncalibrated, electrical acquisition is valid, but value is strictly NaN
+        // 5. Calibration check: never fabricate pH without verified constants/NVS
         if (!_isCalibrated) {
             reading.status = STATUS_CALIBRATION_PENDING;
-            reading.isValid = true; // Signal board reading is electrically healthy
+            reading.isValid = true; // Signal board voltage is electrically healthy
             reading.calibratedValue = NAN;
-            snprintf(reading.message, sizeof(reading.message), "CALIBRATION PENDING");
+            snprintf(reading.message, sizeof(reading.message), "CAL CONSTANTS NEEDED");
             return reading;
         }
 
-        // 6. Compute calibrated pH using linear calibration model
-        float ph = (_slope * reading.reconstructedVoltage) + _intercept;
-
-        // 7. Plausibility sanity bounds (physical pH is 0.0 to 14.0)
-        if (ph < 0.0f || ph > 14.0f) {
-            reading.status = STATUS_ERROR;
-            reading.isValid = false;
+        // A nominal PH-4502C-style curve would map the observed 4.770V board
+        // output to ~13.36 pH. It is unchanged for the RO and tap references,
+        // so it is not a defensible physical pH estimate. Preserve voltage and
+        // verified NVS calibration behaviour, but never publish that false value.
+        if (_isProvisional && PH_REJECT_SUSPECT_PROVISIONAL_RESPONSE) {
+            reading.status = STATUS_CALIBRATION_PENDING;
+            reading.isValid = true;
             reading.calibratedValue = NAN;
-            snprintf(reading.message, sizeof(reading.message), "IMPLAUSIBLE pH (%.1f)", ph);
+            snprintf(reading.message, sizeof(reading.message), "PH RESPONSE SUSPECT");
             return reading;
+        }
+
+        // 6. Compute calibrated pH using finalized 3-point model (or legacy 2-point NVS)
+        float ph = NAN;
+        if (_isThreePoint) {
+            float measMv = _threePtCal.isBoardMv
+                ? (reading.reconstructedVoltage * 1000.0f)
+                : (reading.adcVoltage * 1000.0f);
+            PhEvalResult eval = evaluatePhThreePoint(measMv, _threePtCal, _isProvisional);
+            if (!eval.isValid) {
+                reading.status = eval.outOfCalRange ? STATUS_OUT_OF_CAL_RANGE : STATUS_ERROR;
+                reading.isValid = false;
+                reading.calibratedValue = NAN;
+                snprintf(reading.message, sizeof(reading.message),
+                         eval.outOfCalRange
+                             ? (_isProvisional ? "PROV pH OUT OF RNG" : "pH OUT OF CAL RANGE")
+                             : "pH EVAL ERROR");
+                return reading;
+            }
+            ph = eval.ph;
+        } else {
+            ph = (_slope * reading.reconstructedVoltage) + _intercept;
+            if (isnan(ph) || isinf(ph) || ph < 0.0f || ph > 14.0f) {
+                reading.status = STATUS_ERROR;
+                reading.isValid = false;
+                reading.calibratedValue = NAN;
+                snprintf(reading.message, sizeof(reading.message), "IMPLAUSIBLE pH");
+                return reading;
+            }
         }
 
         reading.calibratedValue = ph;
         reading.isValid = true;
 
-        // 8. Water quality threshold classification
-        if (ph < THRESHOLD_PH_CRITICAL_MIN || ph > THRESHOLD_PH_CRITICAL_MAX) {
+        if (ph < HAZARD_PH_MIN || ph > HAZARD_PH_MAX) {
             reading.status = STATUS_CRITICAL;
-            snprintf(reading.message, sizeof(reading.message), "CRITICAL pH (%.2f)", ph);
+            snprintf(reading.message, sizeof(reading.message), "HAZARD pH (%.2f)", ph);
         } else if (ph < THRESHOLD_PH_WARNING_MIN || ph > THRESHOLD_PH_WARNING_MAX) {
             reading.status = STATUS_WARNING;
-            snprintf(reading.message, sizeof(reading.message), "pH OUT OF RANGE");
+            if (_isProvisional) {
+                snprintf(reading.message, sizeof(reading.message), "%.2f pH (PR-WARN)", ph);
+            } else {
+                snprintf(reading.message, sizeof(reading.message), "pH OUT OF RANGE");
+            }
         } else {
             reading.status = STATUS_OK;
-            snprintf(reading.message, sizeof(reading.message), "NORMAL (%.2f)", ph);
+            if (_isProvisional) {
+                snprintf(reading.message, sizeof(reading.message), "%.2f pH (PROV)", ph);
+            } else {
+                snprintf(reading.message, sizeof(reading.message), "NORMAL (%.2f)", ph);
+            }
         }
 
         return reading;
@@ -280,10 +411,50 @@ public:
 private:
     uint8_t _pin;
     bool _isCalibrated;
+    bool _isProvisional;
+    bool _isThreePoint;
     float _vPh7;
     float _vPh4;
+    float _vPh9;
     float _slope;
     float _intercept;
+    PhThreePointCal _threePtCal;
     uint8_t _stuckCounter;
     float _lastVoltage;
+    char _nvsDiag[144];
+
+    bool saveThreePointIfChanged() {
+        if (verifyNvsReadback()) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; 3pt VERIFIED (acid=%.5f base=%.5f)",
+                     _threePtCal.acidSlope, _threePtCal.baseSlope);
+            return true;
+        }
+
+        Preferences prefs;
+        if (!prefs.begin("watersens", false)) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' NVS write FAILED");
+            return false;
+        }
+
+        prefs.putBool("ph_3pt", true);
+        prefs.putBool("ph_cal", true);
+        prefs.putBool("ph_bmv", _threePtCal.isBoardMv);
+        prefs.putFloat("ph_v4_mv", _threePtCal.v4Mv);
+        prefs.putFloat("ph_v7_mv", _threePtCal.v7Mv);
+        prefs.putFloat("ph_v9_mv", _threePtCal.v9Mv);
+        prefs.putFloat("ph_acid_sl", _threePtCal.acidSlope);
+        prefs.putFloat("ph_base_sl", _threePtCal.baseSlope);
+        prefs.putFloat("ph_v4", _vPh4);
+        prefs.putFloat("ph_v7", _vPh7);
+        prefs.putFloat("ph_slope", _slope);
+        prefs.putFloat("ph_inter", _intercept);
+        prefs.end();
+
+        bool ok = verifyNvsReadback();
+        snprintf(_nvsDiag, sizeof(_nvsDiag),
+                 ok ? "Namespace 'watersens' OK; 3pt SAVED & VERIFIED"
+                    : "Namespace 'watersens' 3pt readback mismatch!");
+        return ok;
+    }
 };

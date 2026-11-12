@@ -33,8 +33,11 @@ export const HistoricalCharts: React.FC<HistoricalChartsProps> = ({
   const turbLimit = activeProfile?.turbidity_max ?? 1.0;
   const tdsLimit = activeProfile?.tds_max ?? 500.0;
 
+  const parseUtcDate = (ts: string) =>
+    new Date(/([zZ]|[+-]\d{2}:?\d{2})$/.test(ts) ? ts : `${ts}Z`);
+
   const chartData = [...readings].reverse().map((r) => {
-    const d = new Date(r.timestamp);
+    const d = parseUtcDate(r.timestamp);
     return {
       time: d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       fullTime: d.toLocaleString(),

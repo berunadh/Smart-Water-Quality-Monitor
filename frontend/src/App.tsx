@@ -10,6 +10,7 @@ import { ThresholdSettingsPanel } from './components/ThresholdSettingsPanel';
 import { SystemDiagnostics } from './components/SystemDiagnostics';
 import { ChatbotPanel } from './components/ChatbotPanel';
 import { DemoScenarioBar } from './components/DemoScenarioBar';
+import { SampleProfileSelector } from './components/SampleProfileSelector';
 import { api } from './services/api';
 import {
   BackendHealth,
@@ -22,6 +23,7 @@ import {
   WaterQualitySettings,
   WaterQualityMode,
   CalibrationStatusDetail,
+  SampleProfileState,
 } from './types';
 import { AlertCircle } from 'lucide-react';
 
@@ -37,6 +39,7 @@ export const App: React.FC = () => {
   const [mlTrends, setMlTrends] = useState<TrendResponse | null>(null);
   const [wqSettings, setWqSettings] = useState<WaterQualitySettings | null>(null);
   const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatusDetail | null>(null);
+  const [sampleProfile, setSampleProfile] = useState<SampleProfileState | null>(null);
 
   const [selectedRange, setSelectedRange] = useState<number>(24);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
@@ -45,9 +48,16 @@ export const App: React.FC = () => {
   const [isSwitchingMode, setIsSwitchingMode] = useState<boolean>(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  const fetchAllData = useCallback(async () => {
+  const fetchAllData = useCallback(async (syncCloud = false) => {
     try {
       setConnectionError(null);
+      if (syncCloud && health?.operating_mode !== 'demo') {
+        try {
+          await api.syncThingSpeak(50);
+        } catch {
+          // Keep dashboard responsive even if ThingSpeak API is temporarily unreachable
+        }
+      }
       const [
         healthRes,
         systemRes,
@@ -59,6 +69,7 @@ export const App: React.FC = () => {
         mlTrendRes,
         settingsRes,
         calRes,
+        profileRes,
       ] = await Promise.allSettled([
         api.getHealth(),
         api.getSystemStatus(),
@@ -70,6 +81,7 @@ export const App: React.FC = () => {
         api.getMLTrends(100),
         api.getWaterQualitySettings(),
         api.getCalibrationStatus(),
+        api.getSampleProfile(),
       ]);
 
       if (healthRes.status === 'fulfilled') setHealth(healthRes.value);
@@ -82,6 +94,7 @@ export const App: React.FC = () => {
       if (mlTrendRes.status === 'fulfilled') setMlTrends(mlTrendRes.value);
       if (settingsRes.status === 'fulfilled') setWqSettings(settingsRes.value);
       if (calRes.status === 'fulfilled') setCalibrationStatus(calRes.value);
+      if (profileRes.status === 'fulfilled') setSampleProfile(profileRes.value);
 
       if (healthRes.status === 'rejected') {
         setConnectionError('Backend server not responding at http://127.0.0.1:8000.');
@@ -89,11 +102,11 @@ export const App: React.FC = () => {
     } catch (err: any) {
       setConnectionError(err.message || 'Error connecting to backend services.');
     }
-  }, [selectedRange]);
+  }, [selectedRange, health?.operating_mode]);
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
-    await fetchAllData();
+    await fetchAllData(true);
     setIsRefreshing(false);
   };
 
@@ -108,6 +121,12 @@ export const App: React.FC = () => {
     } finally {
       setIsSwitchingMode(false);
     }
+  };
+
+  const handleProfileChange = async (profile: SampleProfileState['selected_profile'], ph?: number) => {
+    const updated = await api.setSampleProfile(profile, ph);
+    setSampleProfile(updated);
+    await fetchAllData(false);
   };
 
   const handleResolveAlert = async (alertId: number) => {
@@ -141,10 +160,10 @@ export const App: React.FC = () => {
   };
 
   useEffect(() => {
-    fetchAllData();
+    fetchAllData(true);
     const interval = setInterval(() => {
-      fetchAllData();
-    }, 15000);
+      fetchAllData(true);
+    }, 20000);
     return () => clearInterval(interval);
   }, [fetchAllData]);
 
@@ -194,7 +213,7 @@ export const App: React.FC = () => {
           <div className="space-y-5">
             <OverallStatusBanner reading={reading} evaluation={latestEval} />
             {health?.operating_mode === 'demo' && (
-              <DemoScenarioBar onScenarioInjected={fetchAllData} />
+              <><SampleProfileSelector state={sampleProfile} onChange={handleProfileChange} /><DemoScenarioBar onScenarioInjected={fetchAllData} /></>
             )}
             <SensorCards reading={reading} evaluation={latestEval} settings={wqSettings} />
             <HistoricalCharts

@@ -3,12 +3,21 @@
  */
 
 export type WaterQualityMode = 'drinking' | 'regular_usage';
+export type CalibrationConfidence =
+  | 'VERIFIED_CALIBRATION'
+  | 'MODEL_BASED_PROVISIONAL'
+  | 'DEMONSTRATION_ESTIMATE'
+  | 'UNCALIBRATED'
+  | 'SENSOR_FAULT';
 
 export interface SensorReading {
   id: number;
   entry_id?: number | null;
   device_id: string;
   ph: number | null;
+  ph_sensor_estimate?: number | null;
+  ph_demo_estimate?: number | null;
+  ph_display_source?: 'SENSOR_ESTIMATE' | 'DEMO_ESTIMATE' | string;
   turbidity: number | null;
   tds: number | null; // STRICT: null when uncalibrated or unavailable, NEVER 0
   ph_voltage: number;
@@ -19,6 +28,9 @@ export interface SensorReading {
   ph_calibrated: boolean;
   turbidity_calibrated: boolean;
   tds_calibrated: boolean;
+  ph_calibration_status?: CalibrationConfidence;
+  turbidity_calibration_status?: CalibrationConfidence;
+  tds_calibration_status?: CalibrationConfidence;
   alert_severity: number; // 0=Normal, 1=Warning, 2=Critical, 3=Fault
   alert_messages: string;
   sensor_health_summary: string;
@@ -26,10 +38,18 @@ export interface SensorReading {
   data_source: string;
   operating_mode: string;
   water_quality_mode?: WaterQualityMode | string;
+  sample_profile?: 'live' | 'kent_ro' | 'household_tap' | 'contaminated_demo' | string;
   is_valid: boolean;
   is_stale: boolean;
   timestamp: string;
   validation_notes?: string | null;
+}
+
+export interface SampleProfileState {
+  selected_profile: 'kent_ro' | 'household_tap' | 'contaminated_demo';
+  contaminated_demo_ph: number;
+  updated_at: string;
+  control_note: string;
 }
 
 export interface BackendHealth {
@@ -51,6 +71,10 @@ export interface SystemHealth {
   ph_sensor_healthy: boolean;
   turbidity_sensor_healthy: boolean;
   tds_sensor_healthy?: boolean;
+  tds_dry?: boolean;
+  tds_provisional?: boolean;
+  ph_provisional?: boolean;
+  turb_provisional?: boolean;
   electrical_safe: boolean;
   tds_installed: boolean;
   calibration_pending: boolean;
@@ -89,6 +113,14 @@ export interface WaterQualityEvaluation {
   violated_parameters: string[];
   parameter_evaluations: Record<string, ParameterEvaluation>;
   preliminary_disclaimer: string;
+  wqs?: number | null;
+  q_ph?: number | null;
+  q_turb?: number | null;
+  q_tds?: number | null;
+  water_status_code?: number;
+  water_status_label?: string;
+  critical_hazard?: boolean;
+  hazard_reasons?: string[];
 }
 
 export interface WaterQualitySettings {
@@ -115,6 +147,9 @@ export interface CalibrationStatusDetail {
   ph_calibrated: boolean;
   turbidity_calibrated: boolean;
   tds_calibrated: boolean;
+  ph_provisional?: boolean;
+  turbidity_provisional?: boolean;
+  tds_provisional?: boolean;
   calibration_pending: boolean;
   ph_voltage: number;
   turbidity_voltage: number;

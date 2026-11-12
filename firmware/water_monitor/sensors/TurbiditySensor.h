@@ -3,37 +3,21 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "SensorBase.h"
+#include "TurbiditySensorLogic.h"
 
 /**
  * ============================================================================
- * TURBIDITY SENSOR DRIVER (OPTICAL PROBE + RED SIGNAL CONDITIONING BOARD)
+ * TURBIDITY SENSOR DRIVER (OPTICAL PROBE + SIGNAL CONDITIONING BOARD)
  * ============================================================================
  * Pin: GPIO32 (ADC1_CH4 - Input Only)
  * Circuit: OUT pin -> 15kΩ -> GPIO32 -> 10kΩ -> GND
  * Reconstructed V_board = V_ADC * 2.500
- * 
- * Optical Characteristics:
- * - Clear water (0 NTU): Highest light transmission -> High voltage (typically 3.5 - 4.5V reconstructed)
- * - Turbid water (>50 NTU): Particle scattering blocks transmission -> Voltage decreases monotonically
- * 
- * Calibration Mathematics:
- * - Two-Point Optical Attenuation Model:
- *     Baseline Point: Distilled / Deionized water (0.0 NTU) -> V_clear
- *     Standard Point: Certified Turbidity Standard (e.g. 100 NTU, 400 NTU) -> V_standard, NTU_standard
- *     Validation: V_standard < V_clear (optical monotonicity) and (V_clear - V_standard) >= 0.15V
- * 
- * Conversion Equation:
- *     ΔV = V_clear - V_meas
- *     If ΔV <= 0: NTU = 0.0 (water is at or clearer than 0 NTU baseline)
- *     Else: NTU = (ΔV / (V_clear - V_standard)) * NTU_standard
- * 
- * Physical Validation Rules:
- * - V_clear must be >= 2.00V (clean optical path requires healthy phototransistor transmission)
- * - V_clear strictly greater than V_standard
- * - NTU_standard > 0.0 NTU
- * - Measurement stability standard deviation σ < 0.05V
- * - Never fabricates calibration constants; defaults to STATUS_CALIBRATION_PENDING
- * - Persistent storage in ESP32 Flash NVS via Preferences API
+ *
+ * - Validates optical monotonicity (V_clear > V_standard).
+ * - Preserves clear-water baseline NTU (never assumes visually clear == 0 NTU).
+ * - Rejects readings outside the supported calibration range (triggers Section 8
+ *   critical hazard override when healthy probe goes out of calibration range).
+ * - Preserves existing valid NVS keys in namespace 'watersens'.
  * ============================================================================
  */
 
@@ -42,91 +26,114 @@ public:
     TurbiditySensor(uint8_t pin = PIN_TURBIDITY_ADC)
         : _pin(pin),
           _isCalibrated(false),
+          _isProvisional(false),
+          _usingReferenceProvisionalModel(false),
+          _hasFilteredNtu(false),
+          _filteredNtu(NAN),
           _vClear(0.0f),
           _vStandard(0.0f),
           _ntuStandard(0.0f),
           _stuckCounter(0),
-          _lastVoltage(-1.0f) {}
+          _lastVoltage(-1.0f) {
+        memset(&_cal, 0, sizeof(_cal));
+        _cal.isValid = false;
+        snprintf(_nvsDiag, sizeof(_nvsDiag), "Not checked yet");
+    }
 
     void begin() override {
         pinMode(_pin, INPUT);
-        loadCalibration();
+        loadOrApplyFinalCalibration();
     }
 
-    bool isAvailable() const override {
-        return true;
-    }
-
-    bool isCalibrated() const override {
-        return _isCalibrated;
-    }
+    bool isAvailable() const override { return true; }
+    // True ONLY when experimentally verified via NVS/standards (provisional estimates return false)
+    bool isCalibrated() const override { return _isCalibrated && !_isProvisional; }
+    bool isProvisional() const { return _isCalibrated && _isProvisional; }
+    bool hasCalibrationModel() const { return _isCalibrated; }
 
     float getVClear() const { return _vClear; }
     float getVStandard() const { return _vStandard; }
     float getNtuStandard() const { return _ntuStandard; }
+    const TurbidityCal& getCalibrationModel() const { return _cal; }
+    const char* getNvsDiagnostic() const { return _nvsDiag; }
 
-    /**
-     * Samples the probe stably over a series of readings and returns average voltage
-     * and standard deviation for calibration validation.
-     */
-    bool acquireCalibrationReading(float& avgVoltage, float& stdDev) {
-        return sampleStableVoltage(_pin, 30, 80, avgVoltage, stdDev);
+    bool acquireCalibrationSample(
+        float& outRawAdc,
+        float& outAdcMv,
+        float& outBoardMv,
+        float& outStdDevAdcMv,
+        float& outStdDevBoardMv
+    ) {
+        return sampleStableChannelMilliVolts(
+            _pin, 30, 80, VOLTAGE_RECONSTRUCT_FACTOR,
+            outRawAdc, outAdcMv, outBoardMv, outStdDevAdcMv, outStdDevBoardMv
+        );
     }
 
-    /**
-     * Sets two-point calibration using clear water (0 NTU) baseline and a known NTU standard.
-     * Enforces optical monotonicity (V_clear > V_standard).
-     */
-    bool setCalibration(float vBoardClear, float vBoardStandard, float ntuStandard, bool saveToNvs = true) {
-        // 1. Plausible clear water voltage (must be >= 2.0V reconstructed board voltage)
-        if (vBoardClear < 2.00f || vBoardClear > 5.00f) {
-            Serial.printf("[CAL] ERROR: Clear baseline voltage %.3fV is below minimum threshold (2.00V).\n", 
-                          vBoardClear);
-            Serial.println(F("[CAL] Check optical probe cleanliness, alignment, and wiring."));
+    bool setFinalCalibration(
+        float vClearMv,
+        float ntuClear,
+        float vStdMv,
+        float ntuStd,
+        float vMinMv = NAN,
+        float vMaxMv = NAN,
+        float ntuMin = NAN,
+        float ntuMax = NAN,
+        bool isBoardMv = TURB_CAL_IS_BOARD_MV,
+        bool saveToNvs = true,
+        bool provisional = false
+    ) {
+        TurbidityCal cal = buildTurbidityCalibration(
+            vClearMv, ntuClear, vStdMv, ntuStd,
+            vMinMv, vMaxMv, ntuMin, ntuMax, isBoardMv
+        );
+        if (!cal.isValid) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "Turbidity constants invalid or non-monotonic");
             return false;
         }
 
-        // 2. Optical monotonicity check: V_clear MUST be strictly greater than V_standard
-        if (vBoardStandard >= vBoardClear) {
-            Serial.printf("[CAL] ERROR: Optical inversion! Standard voltage (%.3fV) >= Clear baseline (%.3fV).\n", 
-                          vBoardStandard, vBoardClear);
-            Serial.println(F("[CAL] Optical turbidity sensors must exhibit decreasing voltage with increasing turbidity."));
-            return false;
-        }
-
-        // 3. Minimum voltage drop check (ΔV >= 0.15V)
-        float deltaV = vBoardClear - vBoardStandard;
-        if (deltaV < 0.15f) {
-            Serial.printf("[CAL] ERROR: Insufficient optical attenuation (|ΔV|=%.3fV < 0.15V).\n", deltaV);
-            return false;
-        }
-
-        // 4. Standard NTU must be positive and within reasonable limits
-        if (ntuStandard <= 0.0f || ntuStandard > 3000.0f) {
-            Serial.printf("[CAL] ERROR: Invalid standard NTU reference value (%.1f NTU).\n", ntuStandard);
-            return false;
-        }
-
-        _vClear = vBoardClear;
-        _vStandard = vBoardStandard;
-        _ntuStandard = ntuStandard;
+        _cal = cal;
         _isCalibrated = true;
+        _isProvisional = provisional;
+        _usingReferenceProvisionalModel = false;
+        _hasFilteredNtu = false;
+        _filteredNtu = NAN;
+        _vClear = cal.vClearMv / 1000.0f;
+        _vStandard = cal.vStdMv / 1000.0f;
+        _ntuStandard = cal.ntuStd;
+
+        if (provisional) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "PROVISIONAL RAM curve (Vc=%.0f Vs=%.0f mV); NVS untouched",
+                     vClearMv, vStdMv);
+            Serial.printf("[CAL-Turb] Loaded PROVISIONAL config estimate in RAM: %s\n", _nvsDiag);
+            return true;
+        }
 
         if (saveToNvs) {
-            saveCalibration();
+            return saveCalibration();
         }
-
         return true;
     }
 
-    /**
-     * Safely resets calibration in memory and NVS back to uncalibrated pending state.
-     */
+    bool saveCalibration() {
+        if (_isProvisional) {
+            return false;
+        }
+        return saveIfChanged();
+    }
+
     void resetCalibration() {
         _isCalibrated = false;
+        _isProvisional = false;
+        _usingReferenceProvisionalModel = false;
+        _hasFilteredNtu = false;
+        _filteredNtu = NAN;
         _vClear = 0.0f;
         _vStandard = 0.0f;
         _ntuStandard = 0.0f;
+        memset(&_cal, 0, sizeof(_cal));
+        _cal.isValid = false;
 
         Preferences prefs;
         if (prefs.begin("watersens", false)) {
@@ -134,53 +141,124 @@ public:
             prefs.remove("tb_vc");
             prefs.remove("tb_vs");
             prefs.remove("tb_ntu");
+            prefs.remove("tb_ntu0");
+            prefs.remove("tb_vmin");
+            prefs.remove("tb_vmax");
+            prefs.remove("tb_nmin");
+            prefs.remove("tb_nmax");
+            prefs.remove("tb_bmv");
             prefs.end();
-            Serial.println(F("[CAL] Turbidity calibration erased from NVS. Sensor reset to CALIBRATION_PENDING."));
         }
+        snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' OK; Turbidity calibration reset");
     }
 
     /**
-     * Loads saved calibration coefficients from ESP32 non-volatile storage.
+     * Checks NVS FIRST so user-saved calibration is NEVER overwritten by config.h;
+     * falls back to config.h constants only if NVS has no valid turbidity calibration.
      */
+    void loadOrApplyFinalCalibration() {
+        loadCalibration();
+        if (_isCalibrated && !_isProvisional) {
+            return;
+        }
+
+        bool configSupplied = !isnan((float)TURB_CAL_CLEAR_MV) &&
+                              !isnan((float)TURB_CAL_CLEAR_NTU) &&
+                              !isnan((float)TURB_CAL_STD_MV) &&
+                              !isnan((float)TURB_CAL_STD_NTU);
+
+        if (configSupplied) {
+            setFinalCalibration(
+                (float)TURB_CAL_CLEAR_MV,
+                (float)TURB_CAL_CLEAR_NTU,
+                (float)TURB_CAL_STD_MV,
+                (float)TURB_CAL_STD_NTU,
+                (float)TURB_CAL_MIN_MV,
+                (float)TURB_CAL_MAX_MV,
+                (float)TURB_CAL_MIN_NTU,
+                (float)TURB_CAL_MAX_NTU,
+                TURB_CAL_IS_BOARD_MV,
+                !TURB_CAL_IS_PROVISIONAL,
+                TURB_CAL_IS_PROVISIONAL
+            );
+        } else if (TURB_USE_REFERENCE_PROVISIONAL_MODEL) {
+            setReferenceProvisionalModel();
+        }
+    }
+
     void loadCalibration() {
         Preferences prefs;
-        if (prefs.begin("watersens", true)) { // Read-only mode
-            bool cal = prefs.getBool("tb_cal", false);
-            if (cal) {
-                float vc = prefs.getFloat("tb_vc", 0.0f);
-                float vs = prefs.getFloat("tb_vs", 0.0f);
-                float ntu = prefs.getFloat("tb_ntu", 0.0f);
-
-                if (vc >= 2.00f && vs < vc && (vc - vs) >= 0.15f && ntu > 0.0f) {
-                    _vClear = vc;
-                    _vStandard = vs;
-                    _ntuStandard = ntu;
-                    _isCalibrated = true;
-                    Serial.printf("[CAL] Loaded Turbidity calibration from NVS: V_clear=%.3fV, V_std=%.3fV (%0.1f NTU)\n",
-                                  _vClear, _vStandard, _ntuStandard);
-                } else {
-                    _isCalibrated = false;
-                }
+        if (!prefs.begin("watersens", true)) {
+            if (prefs.begin("watersens", false)) {
+                prefs.end();
+                snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' initialized; awaiting TURB_CAL_*");
             } else {
-                _isCalibrated = false;
+                snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' NVS open FAILED");
             }
+            _isCalibrated = false;
+            Serial.printf("[CAL-NVS] Turbidity: %s\n", _nvsDiag);
+            return;
+        }
+
+        bool hasKey = prefs.isKey("tb_cal");
+        bool calFlag = hasKey ? prefs.getBool("tb_cal", false) : false;
+        if (!hasKey || !calFlag) {
+            _isCalibrated = false;
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; %s (awaiting TURB_CAL_*)",
+                     hasKey ? "tb_cal=false" : "no tb_cal key");
+            Serial.printf("[CAL-NVS] Turbidity: %s\n", _nvsDiag);
             prefs.end();
+            return;
+        }
+
+        float vc = prefs.getFloat("tb_vc", NAN);
+        float vs = prefs.getFloat("tb_vs", NAN);
+        float ntu = prefs.getFloat("tb_ntu", NAN);
+        float ntu0 = prefs.getFloat("tb_ntu0", 0.0f);
+        float vminMv = prefs.getFloat("tb_vmin", NAN);
+        float vmaxMv = prefs.getFloat("tb_vmax", NAN);
+        float nmin = prefs.getFloat("tb_nmin", NAN);
+        float nmax = prefs.getFloat("tb_nmax", NAN);
+        bool bmv = prefs.getBool("tb_bmv", true);
+        prefs.end();
+
+        TurbidityCal loaded = buildTurbidityCalibration(
+            vc * 1000.0f, ntu0, vs * 1000.0f, ntu,
+            vminMv, vmaxMv, nmin, nmax, bmv
+        );
+        if (loaded.isValid) {
+            _cal = loaded;
+            _vClear = vc;
+            _vStandard = vs;
+            _ntuStandard = ntu;
+            _isCalibrated = true;
+            _isProvisional = false;
+            _usingReferenceProvisionalModel = false;
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; tb_cal=true (Vc=%.3fV Vs=%.3fV %.1fNTU VALID)",
+                     _vClear, _vStandard, _ntuStandard);
+            Serial.printf("[CAL] Loaded Turbidity calibration from NVS: %s\n", _nvsDiag);
+        } else {
+            _isCalibrated = false;
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' OK; tb_cal=true REJECTED");
+            Serial.printf("[CAL-NVS] Turbidity: %s\n", _nvsDiag);
         }
     }
 
-    /**
-     * Commits valid calibration parameters to ESP32 flash partition.
-     */
-    void saveCalibration() {
+    bool verifyNvsReadback() const {
+        if (!_cal.isValid) return false;
         Preferences prefs;
-        if (prefs.begin("watersens", false)) { // Read-write mode
-            prefs.putBool("tb_cal", true);
-            prefs.putFloat("tb_vc", _vClear);
-            prefs.putFloat("tb_vs", _vStandard);
-            prefs.putFloat("tb_ntu", _ntuStandard);
-            prefs.end();
-            Serial.println(F("[CAL] Turbidity calibration successfully stored in persistent flash NVS."));
-        }
+        if (!prefs.begin("watersens", true)) return false;
+        bool ok = prefs.getBool("tb_cal", false) &&
+                  fabsf(prefs.getFloat("tb_vc", 0.0f) - _vClear) < 1e-4f &&
+                  fabsf(prefs.getFloat("tb_vs", 0.0f) - _vStandard) < 1e-4f &&
+                  fabsf(prefs.getFloat("tb_ntu", 0.0f) - _ntuStandard) < 1e-2f &&
+                  fabsf(prefs.getFloat("tb_ntu0", -1.0f) - _cal.ntuClear) < 1e-2f;
+        prefs.end();
+        return ok;
     }
 
     SensorReading read() override {
@@ -188,26 +266,15 @@ public:
         memset(&reading, 0, sizeof(reading));
         reading.calibratedValue = NAN;
 
-        // In Demo Mode, simulate clean municipal tap water (0.85 NTU, ~4.2V board, ~1.68V ADC)
-        if (FEATURE_DEMO_MODE) {
-            reading.rawAdc = 2085.0f + (float)(random(-10, 11));
-            reading.adcVoltage = rawToAdcVoltage(reading.rawAdc);
-            reading.reconstructedVoltage = adcToReconstructedVoltage(reading.adcVoltage);
-            reading.calibratedValue = 0.85f + ((2085.0f - reading.rawAdc) * 0.05f);
-            if (reading.calibratedValue < 0.1f) reading.calibratedValue = 0.1f;
-            reading.status = STATUS_OK;
-            reading.isValid = true;
-            snprintf(reading.message, sizeof(reading.message), "DEMO (0.85 NTU)");
-            return reading;
-        }
-
-        // 1. Oversample ADC with trimmed mean
-        reading.rawAdc = sampleAdcTrimmed(_pin, ADC_OVERSAMPLE_SAMPLES, ADC_SAMPLE_DELAY_MS);
-        reading.adcVoltage = rawToAdcVoltage(reading.rawAdc);
+        // 1. Oversample ADC with factory-calibrated mV + 2.5x divider reconstruction
+        sampleChannelTrimmedMilliVolts(_pin, ADC_OVERSAMPLE_SAMPLES, ADC_SAMPLE_DELAY_MS,
+                                       reading.rawAdc, reading.adcVoltage);
         reading.reconstructedVoltage = adcToReconstructedVoltage(reading.adcVoltage);
 
         // 2. Electrical Over-Range Safety Check
         if (isOverRange(reading.rawAdc, reading.adcVoltage)) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
             reading.status = STATUS_OVER_RANGE;
             reading.isValid = false;
             reading.calibratedValue = NAN;
@@ -215,8 +282,10 @@ public:
             return reading;
         }
 
-        // 3. Disconnected / Probe off check (optical probe powered off gives ~0V)
-        if (reading.adcVoltage < ADC_DISCONNECTED_VOLTS) {
+        // 3. Disconnected / Probe off check (guards against ESP32 0-count ~140mV mV intercept)
+        if (reading.rawAdc < ADC_DISCONNECTED_RAW || reading.adcVoltage < ADC_DISCONNECTED_VOLTS) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
             reading.status = STATUS_DISCONNECTED;
             reading.isValid = false;
             reading.calibratedValue = NAN;
@@ -224,61 +293,87 @@ public:
             return reading;
         }
 
-        // 4. Stuck reading detection
-        if (_lastVoltage > 0.0f && abs(reading.adcVoltage - _lastVoltage) < 0.0005f) {
-            _stuckCounter++;
-            if (_stuckCounter > 15) {
-                reading.status = STATUS_STUCK;
-                reading.isValid = false;
-                reading.calibratedValue = NAN;
-                snprintf(reading.message, sizeof(reading.message), "STUCK READING");
-                return reading;
-            }
-        } else {
-            _stuckCounter = 0;
-            _lastVoltage = reading.adcVoltage;
-        }
-
-        // 5. Calibration check: If uncalibrated, electrical acquisition is valid, but value is strictly NaN
-        if (!_isCalibrated) {
-            reading.status = STATUS_CALIBRATION_PENDING;
-            reading.isValid = true; // Signal board reading is electrically healthy
-            reading.calibratedValue = NAN;
-            snprintf(reading.message, sizeof(reading.message), "CALIBRATION PENDING");
+        // Stable optical output is not by itself a sensor failure.
+        if (isStableVoltageFault(reading.adcVoltage, _lastVoltage, _stuckCounter)) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
+            reading.status = STATUS_STUCK;
+            reading.isValid = false;
+            snprintf(reading.message, sizeof(reading.message), "STUCK READING");
             return reading;
         }
 
-        // 6. Compute calibrated turbidity using optical attenuation model
-        // NTU = ((V_clear - V_meas) / (V_clear - V_standard)) * NTU_standard
-        float deltaV = _vClear - reading.reconstructedVoltage;
-        if (deltaV < 0.0f) {
-            deltaV = 0.0f; // Cleaner than baseline clear water
+        // 5. Calibration check
+        if (!_isCalibrated) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
+            reading.status = STATUS_CALIBRATION_PENDING;
+            reading.isValid = true; // Signal board voltage is electrically healthy
+            reading.calibratedValue = NAN;
+            snprintf(reading.message, sizeof(reading.message), "CAL CONSTANTS NEEDED");
+            return reading;
         }
-        
-        float ntu = (deltaV / (_vClear - _vStandard)) * _ntuStandard;
 
-        // 7. Sanity bounds check
-        if (ntu < 0.0f || ntu > 3000.0f) {
+        // 6. Use actual-standard calibration when present, else the provisional
+        // reference-anchor NTU model anchored at Kent RO (0.939V) and Tap (1.484V).
+        float measMv = _cal.isBoardMv
+            ? (reading.reconstructedVoltage * 1000.0f)
+            : (reading.adcVoltage * 1000.0f);
+        TurbidityEvalResult eval = _usingReferenceProvisionalModel
+            ? evaluateReferenceTurbidityProvisionalModel(
+                reading.reconstructedVoltage,
+                TURB_PROV_RO_BOARD_V,
+                TURB_PROV_RO_NTU,
+                TURB_PROV_TAP_BOARD_V,
+                TURB_PROV_TAP_NTU,
+                TURB_PROV_MIN_BOARD_V,
+                TURB_PROV_MAX_BOARD_V,
+                TURB_PROV_FLOOR_NTU,
+                TURB_PROV_MAX_ESTIMATE_NTU
+              )
+            : evaluateTurbidityReading(measMv, _cal);
+        if (!eval.isValid || isnan(eval.ntu) || isinf(eval.ntu)) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
+            reading.status = eval.outOfCalRange ? STATUS_OUT_OF_CAL_RANGE : STATUS_ERROR;
+            reading.isValid = false;
+            reading.calibratedValue = NAN;
+            snprintf(reading.message, sizeof(reading.message),
+                     eval.outOfCalRange
+                         ? (_isProvisional ? "PROV TB OUT OF RNG" : "OUT OF CAL RANGE")
+                         : "TURB EVAL ERROR");
+            return reading;
+        }
+
+        // 7. Apply EMA smoothing to suppress ADC noise; single filtered NTU value
+        // is consumed identically by OLED display and ThingSpeak Field 2.
+        float ntu = applyTurbidityEmaFilter(eval.ntu, _hasFilteredNtu, _filteredNtu, TURB_FILTER_ALPHA);
+        if (isnan(ntu) || isinf(ntu) || ntu < 0.0f) {
+            _hasFilteredNtu = false;
+            _filteredNtu = NAN;
             reading.status = STATUS_ERROR;
             reading.isValid = false;
             reading.calibratedValue = NAN;
-            snprintf(reading.message, sizeof(reading.message), "IMPLAUSIBLE NTU (%.0f)", ntu);
+            snprintf(reading.message, sizeof(reading.message), "TURB FILTER ERROR");
             return reading;
         }
-
         reading.calibratedValue = ntu;
         reading.isValid = true;
 
-        // 8. Water quality threshold classification
-        if (ntu >= THRESHOLD_TURB_CRITICAL_NTU) {
+        if (ntu > HAZARD_TURB_MAX_NTU) {
             reading.status = STATUS_CRITICAL;
-            snprintf(reading.message, sizeof(reading.message), "HIGH TURBIDITY (%.1f)", ntu);
+            snprintf(reading.message, sizeof(reading.message), "HAZARD TURB (%.1f)", ntu);
+        } else if (ntu >= THRESHOLD_TURB_CRITICAL_NTU) {
+            reading.status = STATUS_CRITICAL;
+            snprintf(reading.message, sizeof(reading.message), "HIGH TURB (%.1f)", ntu);
         } else if (ntu >= THRESHOLD_TURB_WARNING_NTU) {
             reading.status = STATUS_WARNING;
-            snprintf(reading.message, sizeof(reading.message), "ELEVATED NTU (%.1f)", ntu);
+            snprintf(reading.message, sizeof(reading.message),
+                     _isProvisional ? "%.1f NTU (PR-WARN)" : "ELEVATED NTU (%.1f)", ntu);
         } else {
             reading.status = STATUS_OK;
-            snprintf(reading.message, sizeof(reading.message), "CLEAR (%.1f NTU)", ntu);
+            snprintf(reading.message, sizeof(reading.message),
+                     _isProvisional ? "%.1f NTU (PROV)" : "%.1f NTU", ntu);
         }
 
         return reading;
@@ -287,9 +382,64 @@ public:
 private:
     uint8_t _pin;
     bool _isCalibrated;
+    bool _isProvisional;
+    bool _usingReferenceProvisionalModel;
+    bool _hasFilteredNtu;
+    float _filteredNtu;
     float _vClear;
     float _vStandard;
     float _ntuStandard;
+    TurbidityCal _cal;
     uint8_t _stuckCounter;
     float _lastVoltage;
+    char _nvsDiag[144];
+
+    void setReferenceProvisionalModel() {
+        _isCalibrated = true;
+        _isProvisional = true;
+        _usingReferenceProvisionalModel = true;
+        _hasFilteredNtu = false;
+        _filteredNtu = NAN;
+        _vClear = 0.0f;
+        _vStandard = 0.0f;
+        _ntuStandard = 0.0f;
+        memset(&_cal, 0, sizeof(_cal));
+        _cal.isValid = false;
+        snprintf(_nvsDiag, sizeof(_nvsDiag),
+                 "PROVISIONAL 2-ref NTU estimate (RO %.3fV->%.2f, Tap %.3fV->%.2f); NVS untouched",
+                 TURB_PROV_RO_BOARD_V, TURB_PROV_RO_NTU, TURB_PROV_TAP_BOARD_V, TURB_PROV_TAP_NTU);
+        Serial.printf("[CAL-Turb] Loaded %s\n", _nvsDiag);
+    }
+
+    bool saveIfChanged() {
+        if (verifyNvsReadback()) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag),
+                     "Namespace 'watersens' OK; tb_cal=true VERIFIED (Vc=%.3fV Vs=%.3fV)",
+                     _vClear, _vStandard);
+            return true;
+        }
+
+        Preferences prefs;
+        if (!prefs.begin("watersens", false)) {
+            snprintf(_nvsDiag, sizeof(_nvsDiag), "Namespace 'watersens' NVS write FAILED");
+            return false;
+        }
+        prefs.putBool("tb_cal", true);
+        prefs.putFloat("tb_vc", _vClear);
+        prefs.putFloat("tb_vs", _vStandard);
+        prefs.putFloat("tb_ntu", _ntuStandard);
+        prefs.putFloat("tb_ntu0", _cal.ntuClear);
+        prefs.putFloat("tb_vmin", _cal.vMinMv);
+        prefs.putFloat("tb_vmax", _cal.vMaxMv);
+        prefs.putFloat("tb_nmin", _cal.ntuMin);
+        prefs.putFloat("tb_nmax", _cal.ntuMax);
+        prefs.putBool("tb_bmv", _cal.isBoardMv);
+        prefs.end();
+
+        bool ok = verifyNvsReadback();
+        snprintf(_nvsDiag, sizeof(_nvsDiag),
+                 ok ? "Namespace 'watersens' OK; tb_cal=true SAVED & VERIFIED"
+                    : "Namespace 'watersens' tb_cal readback mismatch!");
+        return ok;
+    }
 };

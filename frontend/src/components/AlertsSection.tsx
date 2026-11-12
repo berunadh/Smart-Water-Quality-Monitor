@@ -134,10 +134,14 @@ export const AlertsSection: React.FC<AlertsSectionProps> = ({
                       <div className="flex items-center space-x-3 text-[11px] text-slate-400 mt-1.5">
                         <span className="flex items-center space-x-1">
                           <Clock className="h-3 w-3" />
-                          <span>Triggered: {new Date(alert.timestamp).toLocaleString()}</span>
+                          <span>
+                            Triggered: {new Date(/([zZ]|[+-]\d{2}:?\d{2})$/.test(alert.timestamp) ? alert.timestamp : `${alert.timestamp}Z`).toLocaleString()}
+                          </span>
                         </span>
                         {alert.resolved_at && (
-                          <span>• Resolved: {new Date(alert.resolved_at).toLocaleTimeString()}</span>
+                          <span>
+                            • Resolved: {new Date(/([zZ]|[+-]\d{2}:?\d{2})$/.test(alert.resolved_at) ? alert.resolved_at : `${alert.resolved_at}Z`).toLocaleTimeString()}
+                          </span>
                         )}
                       </div>
                     </div>

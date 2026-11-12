@@ -15,6 +15,11 @@ class WaterReadingModel(Base):
 
     # Physical / Calibrated measurements (Nullable if uncalibrated or absent)
     ph = Column(Float, nullable=True)                  # Calibrated pH (e.g. 6.5 - 8.5)
+    # `ph` is the selected display value for backwards-compatible Field 1/API use.
+    # Keep sensor and presentation values separate: a demo value is never a physical pH measurement.
+    ph_sensor_estimate = Column(Float, nullable=True)
+    ph_demo_estimate = Column(Float, nullable=True)
+    ph_display_source = Column(String(32), default="SENSOR_ESTIMATE", nullable=False)
     turbidity = Column(Float, nullable=True)           # Calibrated Turbidity in NTU
     tds = Column(Float, nullable=True)                 # Calibrated TDS in ppm (STRICT: NULL if uncalibrated)
 
@@ -40,6 +45,7 @@ class WaterReadingModel(Base):
     data_source = Column(String(32), default="thingspeak", nullable=False)  # "thingspeak" | "simulated" | "sensor_node"
     operating_mode = Column(String(16), default="real", nullable=False)     # "real" | "demo"
     water_quality_mode = Column(String(32), default="drinking", nullable=False)  # "drinking" | "regular_usage"
+    sample_profile = Column(String(32), default="live", nullable=False)  # live | kent_ro | household_tap | contaminated_demo
     is_valid = Column(Boolean, default=True, nullable=False)
     is_stale = Column(Boolean, default=False, nullable=False)
     validation_notes = Column(String(255), nullable=True)

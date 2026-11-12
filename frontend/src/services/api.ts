@@ -17,6 +17,7 @@ import {
   WaterQualitySettings,
   WaterQualityMode,
   CalibrationStatusDetail,
+  SampleProfileState,
 } from '../types';
 
 const API_BASE = '/api';
@@ -170,5 +171,20 @@ export const api = {
   async getCalibrationStatus(): Promise<CalibrationStatusDetail> {
     const res = await fetch(`${API_BASE}/calibration/status`);
     return handleResponse<CalibrationStatusDetail>(res);
+  },
+
+  async getSampleProfile(): Promise<SampleProfileState> {
+    const res = await fetch(`${API_BASE}/sample-profile`);
+    return handleResponse<SampleProfileState>(res);
+  },
+
+  async setSampleProfile(
+    selected_profile: SampleProfileState['selected_profile'], contaminated_demo_ph?: number,
+  ): Promise<SampleProfileState> {
+    const res = await fetch(`${API_BASE}/sample-profile`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selected_profile, contaminated_demo_ph }),
+    });
+    return handleResponse<SampleProfileState>(res);
   },
 };

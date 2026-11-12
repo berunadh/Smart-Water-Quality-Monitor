@@ -49,11 +49,12 @@
  * FIELD MAPPINGS:
  * - Field 1: Calibrated pH (omitted if uncalibrated or in error)
  * - Field 2: Calibrated Turbidity (NTU, omitted if uncalibrated or in error)
- * - Field 3: TDS (ppm, strictly omitted / blank until sensor is installed. NEVER 0)
+ * - Field 3: TDS (ppm, strictly omitted unless calibrated, valid & immersed. NEVER 0 or raw V)
  * - Field 4: Alert Severity (0 = Normal, 1 = Warning, 2 = Critical, 3 = Fault)
  * - Field 5: pH Board Output Voltage (V_sensor = V_ADC * 2.50)
  * - Field 6: Turbidity Board Output Voltage (V_sensor = V_ADC * 2.50)
  * - Field 7: System Health Bitmask (16-bit integer)
+ * - Field 8: Optional TDS Direct ADC Voltage on GPIO35 (1.0x, diagnostic only)
  * ============================================================================
  */
 
@@ -283,37 +284,58 @@ public:
         // --------------------------------------------------------------------
         String postData = "api_key=" + String(THINGSPEAK_WRITE_API_KEY);
 
-        // Field 1: Calibrated pH (strictly omitted if uncalibrated, NaN, or Inf)
-        if (ph.isValid && !isnan(ph.calibratedValue) && !isinf(ph.calibratedValue) && ph.status != STATUS_CALIBRATION_PENDING) {
+        bool phHasVal = (ph.isValid && !isnan(ph.calibratedValue) && !isinf(ph.calibratedValue) &&
+                         ph.status != STATUS_CALIBRATION_PENDING && ph.status != STATUS_OUT_OF_CAL_RANGE);
+        bool turbHasVal = (turb.isValid && !isnan(turb.calibratedValue) && !isinf(turb.calibratedValue) &&
+                           turb.status != STATUS_CALIBRATION_PENDING && turb.status != STATUS_OUT_OF_CAL_RANGE);
+        bool tdsHasVal = (FEATURE_TDS_ENABLED && tds.isValid && !isnan(tds.calibratedValue) && !isinf(tds.calibratedValue) &&
+                          tds.status != STATUS_CALIBRATION_PENDING && tds.status != STATUS_DRY_OR_NOT_IMMERSED &&
+                          tds.status != STATUS_DISCONNECTED && tds.status != STATUS_OVER_RANGE &&
+                          tds.status != STATUS_STUCK && tds.status != STATUS_ERROR &&
+                          tds.status != STATUS_UNAVAILABLE);
+
+#if THINGSPEAK_USE_5FIELD_PROFILE
+        // Documented 5-Field Profile (Design Doc Channel 3448045 compatible layout):
+        // field1=TDS ppm, field2=pH, field3=Turbidity NTU, field4=Custom WQS, field5=System status code
+        if (tdsHasVal) {
+            postData += "&field1=" + String(tds.calibratedValue, 0);
+        }
+        if (phHasVal) {
+            postData += "&field2=" + String(ph.calibratedValue, 2);
+        }
+        if (turbHasVal) {
+            postData += "&field3=" + String(turb.calibratedValue, 1);
+        }
+        if (validator.isWqsValid() && !isnan(validator.getWqs()) && !isinf(validator.getWqs())) {
+            postData += "&field4=" + String(validator.getWqs(), 1);
+        }
+        postData += "&field5=" + String(validator.getWaterStatusCode());
+#else
+        // Existing Project 8-Field Mapping (Channel ID 3570138):
+        // Field 1: Calibrated pH (omitted if uncalibrated, out-of-range, or in error)
+        if (phHasVal) {
             postData += "&field1=" + String(ph.calibratedValue, 2);
         }
 
-        // Field 2: Calibrated Turbidity (strictly omitted if uncalibrated, NaN, or Inf)
-        if (turb.isValid && !isnan(turb.calibratedValue) && !isinf(turb.calibratedValue) && turb.status != STATUS_CALIBRATION_PENDING) {
+        // Field 2: Calibrated Turbidity (strictly omitted if uncalibrated, out-of-range, or in error)
+        if (turbHasVal) {
             postData += "&field2=" + String(turb.calibratedValue, 1);
         }
 
-        // Field 3: TDS ppm (strictly omitted if uncalibrated, disconnected, invalid, or NaN. NEVER raw voltage or fake 0)
-        if (FEATURE_TDS_ENABLED &&
-            tds.isValid &&
-            tds.status != STATUS_UNAVAILABLE &&
-            tds.status != STATUS_CALIBRATION_PENDING &&
-            tds.status != STATUS_DISCONNECTED &&
-            tds.status != STATUS_OVER_RANGE &&
-            !isnan(tds.calibratedValue) &&
-            !isinf(tds.calibratedValue)) {
+        // Field 3: TDS ppm (uploaded for valid/critical liquid readings; omitted when dry/fault/uncalibrated)
+        if (tdsHasVal) {
             postData += "&field3=" + String(tds.calibratedValue, 0);
         }
 
         // Field 4: Alert Severity code (0=Normal, 1=Warning, 2=Critical, 3=Fault)
         postData += "&field4=" + String((int)validator.getSeverity());
 
-        // Field 5: pH signal board reconstructed voltage (uncalibrated diagnostic)
+        // Field 5: pH signal board reconstructed voltage (2.5x)
         if (!isnan(ph.reconstructedVoltage) && !isinf(ph.reconstructedVoltage) && ph.reconstructedVoltage >= 0.0f) {
             postData += "&field5=" + String(ph.reconstructedVoltage, 3);
         }
 
-        // Field 6: Turbidity signal board reconstructed voltage (uncalibrated diagnostic)
+        // Field 6: Turbidity signal board reconstructed voltage (2.5x)
         if (!isnan(turb.reconstructedVoltage) && !isinf(turb.reconstructedVoltage) && turb.reconstructedVoltage >= 0.0f) {
             postData += "&field6=" + String(turb.reconstructedVoltage, 3);
         }
@@ -322,10 +344,10 @@ public:
         postData += "&field7=" + String(validator.getHealthCode());
 
         // Field 8 (Optional Diagnostic): TDS direct ADC voltage (GPIO35, 1.0x)
-        // Stored if Field 8 is enabled on ThingSpeak channel; cleanly ignored otherwise.
         if (FEATURE_TDS_ENABLED && !isnan(tds.adcVoltage) && !isinf(tds.adcVoltage) && tds.adcVoltage >= 0.0f) {
             postData += "&field8=" + String(tds.adcVoltage, 3);
         }
+#endif
 
         // --------------------------------------------------------------------
         // 5. Transmit HTTP POST to ThingSpeak API
@@ -384,6 +406,7 @@ public:
         }
         Serial.printf("ThingSpeak Config Valid    : %s\n", _isThingSpeakConfigValid ? "YES" : "NO (Check secrets.h)");
         Serial.printf("ThingSpeak Channel ID      : %lu\n", (unsigned long)THINGSPEAK_CHANNEL_ID);
+        Serial.printf("ThingSpeak Field Profile   : %s\n", THINGSPEAK_USE_5FIELD_PROFILE ? "5-FIELD (Documented)" : "8-FIELD (Default)");
         Serial.printf("Successful Cloud Uploads   : %lu\n", _uploadCount);
         Serial.printf("Failed Cloud Uploads       : %lu\n", _failedUploads);
         Serial.printf("Last Upload Entry ID       : %ld\n", _lastEntryId);

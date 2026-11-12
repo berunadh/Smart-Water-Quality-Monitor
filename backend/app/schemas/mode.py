@@ -59,6 +59,14 @@ class WaterQualityEvaluation(BaseModel):
     violated_parameters: List[str]
     parameter_evaluations: Dict[str, ParameterEvaluation]
     preliminary_disclaimer: str
+    wqs: Optional[float] = None
+    q_ph: Optional[float] = None
+    q_turb: Optional[float] = None
+    q_tds: Optional[float] = None
+    water_status_code: int = -1
+    water_status_label: str = "Fault"
+    critical_hazard: bool = False
+    hazard_reasons: List[str] = []
 
 
 class WaterQualitySettingsResponse(BaseModel):

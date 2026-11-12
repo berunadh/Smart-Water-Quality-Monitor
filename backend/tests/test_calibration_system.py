@@ -131,7 +131,7 @@ def test_calibration_api_endpoints():
     assert "turbidity_calibrated" in data
     assert "calibration_pending" in data
     assert "ph_reference_standards" in data
-    assert len(data["ph_reference_standards"]) == 2
+    assert len(data["ph_reference_standards"]) == 3
 
     # 2. Log calibration record
     record_payload = {

@@ -32,19 +32,19 @@
    - *(Optional Board Hardware Trimming)*: If your green board has an offset potentiometer, turn the potentiometer until `Vboard` reads approximately **2.50 V** (which corresponds to ~1.00 V at the ADC).
    - In the Serial Monitor, send the command:
      ```text
-     cal_ph7
+     ph cal 7.00
      ```
-   - The firmware records this voltage as the neutral zero-potential point.
+   - The firmware records this voltage as the neutral zero-potential staging point.
 
-3. **Step B: Acidic Buffer (pH 4.01)**:
+3. **Step B: Acidic Buffer (pH 4.01) & Confirm**:
    - Remove the probe, rinse thoroughly with distilled water, and blot dry.
    - Submerge the probe into the **pH 4.01 buffer solution**.
    - Wait 60 seconds for thermal and chemical equilibrium.
-   - In the Serial Monitor, send the command:
+   - In the Serial Monitor, send:
      ```text
-     cal_ph4
+     ph cal 4.01
      ```
-   - The firmware calculates the exact electrode slope ($mV/\text{pH}$) and activates live calibrated pH readings.
+   - Review the proposal and send `ph confirm` to commit the electrode slope ($mV/\text{pH}$) to NVS and activate live calibrated pH readings.
 
 4. **Verification**:
    - Rinse and re-submerge into the pH 7.00 buffer. The OLED should now display:
@@ -77,29 +77,75 @@ The optical turbidity probe features an Infrared (IR) emitter LED and a phototra
    - Observe the reconstructed board voltage (`Vboard`). It should typically stabilize between **4.0 V and 4.5 V**.
    - In the Serial Monitor, send the command:
      ```text
-     cal_turb_clear
+     turb cal clear
      ```
-   - The firmware locks this voltage as the `0 NTU` reference baseline.
+   - The firmware stages this voltage as the `0 NTU` reference baseline.
 
-2. **Step B: Standard Verification (Optional / Advanced)**:
-   - If using a certified turbidity standard (e.g., 100 NTU Formazin standard):
+2. **Step B: Standard Calibration & Confirm**:
+   - Using a certified turbidity standard (e.g., 100 NTU Formazin standard):
    - Immerse the probe in the 100 NTU standard.
    - Send:
      ```text
-     cal_turb_std 100
+     turb cal 100
      ```
+   - Review the optical attenuation proposal and send `turb confirm` to commit to NVS.
 
 ---
 
-## 3. Interactive Serial CLI Command Reference
+## 3. TDS Sensor Calibration & Verification (`TDS Meter V1.0` on GPIO 35)
 
-The ESP32 firmware includes a real-time calibration interpreter over USB Serial:
+### Hardware Wiring & Electrical Contract
+- **TDS `A` (Analog Out)** → **ESP32 GPIO 35** (`ADC1_CH7`, input-only)
+- **TDS `+` (Power)** → **ESP32 3V3**
+- **TDS `-` (Ground)** → **Common GND**
+- **Voltage Divider**: **None** (`TDS_VOLTAGE_MULTIPLIER = 1.00f`; direct ADC input without the pH/turbidity ÷2.5 divider). TDS voltage is sampled using ESP32 factory-calibrated `analogReadMilliVolts()` alongside raw ADC counts.
+
+### Important Limitations & Compatibility Notice
+1. **Generic `TDS Meter V1.0` Compatibility**: The PCB silkscreen `TDS Meter V1.0` alone does **not** prove the module shares the exact DFRobot SEN0244 transfer curve (`TDS_raw = (133.42·V³ - 255.86·V² + 857.39·V) × 0.5`). Single-point `kFactor` calibration scales at `342 ppm`, but does **not** guarantee full-range `0–3000 ppm` linearity across every third-party board revision.
+2. **Temperature Limitation (~25°C Nominal)**: The firmware has **no temperature sensor** and performs **no automatic temperature compensation**. Calibrate and measure near **25°C**; results are preliminary monitoring values, not laboratory-grade measurements.
+3. **Preflight vs. Actual Calibration**:
+   - **Preflight testing** (dry air and clean distilled/deionized water) only verifies wiring safety (`< 3.05 V`), signal stability, and baseline behavior—**never calibrate against tap water or an unknown preflight liquid**.
+   - **Actual calibration** requires a **certified 342 ppm NaCl** TDS calibration solution (entered in **ppm**, **not** µS/cm) near **25°C**.
+4. **Dry vs. Ultra-Pure Water Overlap**: If your board outputs a small baseline offset when dry (or falls inside the ESP32 `ADC_11db` 0–2 raw count deadzone), voltage alone cannot always distinguish dry air from near-0 ppm distilled water. An optional `tds dry` baseline command is provided only after verifying dry vs. distilled voltages on the final firmware.
+
+### Step-by-Step TDS Calibration Procedure
+1. **Preflight & Existing Calibration Check**:
+   - Open Serial Monitor at **115200 baud** with **Newline** line ending.
+   - Run `cal status` to verify existing **pH** (`GPIO34`) and **Turbidity** (`GPIO32`) calibrations are intact in NVS (`watersens` namespace). **Do not run `ph reset`, `turb reset`, or `cal reset`.**
+   - Run `status` with the TDS probe dry in air, and again in clean distilled/deionized water after 30–60 s stabilization. Verify `Vadc < 3.05 V` and readings are stable.
+2. **Prepare the Certified 342 ppm NaCl Solution (~25°C)**:
+   - Pour a small amount into a clean cup, rinse the probe tip with distilled water, gently shake/blot excess drops, and immerse to the immersion mark (keep PCB/upper cable dry and probe centered away from walls/bottom; tap away bubbles). Wait **30–60 seconds**.
+3. **Stage Calibration Proposal**:
+   - Run:
+     ```text
+     tds cal 342
+     ```
+   - Verify the proposal reports `Sample Stability Check : PASSED (σ <= 0.050 V)`, `Electrical Voltage Check : PASSED (0.10 - 2.95 V)`, and `Derived Cell Constant (kFactor)` within `0.15 - 5.00`.
+4. **Transactional Live Verification & NVS Commit**:
+   - Keep the probe steady in the 342 ppm solution and run:
+     ```text
+     tds confirm
+     ```
+   - The firmware applies the candidate `kFactor` in RAM, performs a fresh live reading, checks that it falls within **±5.0% (`324.9–359.1 ppm`)**, and **only then** commits (`tds_cal`, `tds_k`, `tds_vs`, `tds_ref`) to NVS and verifies NVS readback. If live verification fails, nothing is written to NVS and any previous calibration is preserved.
+5. **Post-Reboot Persistence Check**:
+   - Unplug ESP32 USB power for 5 seconds, reconnect, open Serial Monitor at 115200 baud, verify `[CAL] Loaded TDS calibration from NVS` prints at boot, and run `cal status` to confirm TDS reports `CALIBRATED` alongside unchanged pH and Turbidity calibrations.
+
+---
+
+## 4. Interactive Serial CLI Command Reference
+
+The ESP32 firmware includes a real-time calibration interpreter over USB Serial (**115200 baud, Newline**):
 
 | Command | Action | Description |
 | :--- | :--- | :--- |
-| `help` or `?` | Help Menu | Displays the list of all available bench commands |
+| `help` or `?` | Help Menu | Displays all bench calibration, mode, and diagnostic commands |
 | `status` | Print Diagnostics | Dumps raw ADC, $V_{ADC}$, $V_{board}$, health bitmask, and Wi-Fi state |
-| `cal_ph7` | Calibrate pH 7 | Samples current $V_{board}$ and registers it as pH 7.00 reference |
-| `cal_ph4` | Calibrate pH 4 | Samples current $V_{board}$ and registers it as pH 4.01 reference |
-| `cal_turb_clear` | Calibrate 0 NTU | Registers current $V_{board}$ as clean water baseline |
-| `cal_reset` | Reset Calibration | Clears all coefficients back to `CALIBRATION PENDING` |
+| `cal status` | Calibration Status | Shows NVS-stored pH, Turbidity, and TDS coefficients and live status |
+| `ph cal 7.00` / `ph cal 4.01` / `ph confirm` | Calibrate pH | Two-point buffer calibration on GPIO34 (`÷2.5` divider); `ph cancel` / `ph reset` |
+| `turb cal clear` / `turb cal <NTU>` / `turb confirm` | Calibrate Turbidity | Two-point optical calibration on GPIO32 (`÷2.5` divider); `turb cancel` / `turb reset` |
+| `tds dry` / `tds dry clear` | Optional TDS Dry Baseline | Records or clears measured dry-air baseline voltage for GPIO35 |
+| `tds cal 342` | Stage TDS Proposal | Computes `kFactor` in certified 342 ppm NaCl standard at ~25°C (ppm, NOT µS/cm) |
+| `tds confirm` | Verify & Save TDS | Live-verifies reading (`325–359 ppm`) before committing TDS NVS keys |
+| `tds cancel` / `tds reset` | Abort / Reset TDS | Cancels pending TDS proposal or clears ONLY TDS NVS keys |
+| `mode drinking` / `mode regular` | Switch Mode | Switches between Drinking (IS 10500:2012) and Regular Usage limits |
+| `cal reset` | Global Reset | **Caution**: Clears ALL sensor calibrations (pH, Turbidity, and TDS) |

@@ -55,6 +55,13 @@ public:
     }
 
     /**
+     * Triggers a brief non-blocking manual diagnostic chirp on GPIO25.
+     */
+    void triggerTestBeep() {
+        playStartupBeep();
+    }
+
+    /**
      * Updates buzzer state machine cleanly without blocking.
      * 
      * STRICT RULE:

@@ -352,3 +352,71 @@ def test_settings_api_endpoints_and_chatbot_context():
 
     # Restore original mode
     client.put("/api/settings/mode", json={"mode": orig_mode})
+
+
+@pytest.mark.asyncio
+async def test_dry_tds_fault_and_chatbot_missing_tds_handling(isolated_db, monkeypatch):
+    """Dry/faulty TDS preserves Field 3 null + Field 8 voltage, and chatbot distinguishes missing TDS."""
+    from app.chatbot.agent import WaterChatbotAgent
+
+    now = datetime.utcnow()
+    dry_fault_item = ThingSpeakFeedItem(
+        entry_id=701,
+        created_at=now,
+        field1="7.22",
+        field2="0.6",
+        field3="",       # Omitted for dry/faulty TDS
+        field4="3",      # Fault severity
+        field5="2.51",
+        field6="4.20",
+        field7="256",    # Bit 8: HEALTH_TDS_FAULT
+        field8="0.142",  # Diagnostic voltage preserved
+    )
+    res = ThingSpeakService.process_and_save_feeds(isolated_db, [dry_fault_item])
+    assert res.new_records_saved == 1
+
+    rec = isolated_db.query(WaterReadingModel).filter_by(entry_id=701).one()
+    assert rec.tds is None
+    assert rec.tds_calibrated is False
+    assert rec.tds_voltage == 0.142
+
+    config = ModeService.get_or_create_config(isolated_db)
+    ev = ModeService.evaluate_reading(rec, config)
+    assert ev.parameter_evaluations["tds"].status == "fault"
+    assert ev.violated_parameters == []  # Fault is NOT a water-quality threshold violation
+
+    # Chatbot fallback must clearly distinguish raw voltage (0.142V) from missing ppm and note 25C limit
+    agent = WaterChatbotAgent()
+    monkeypatch.setattr(agent, "_get_llm_adapter", lambda: None)
+    chat_resp = await agent.answer_query("What is my TDS right now?", isolated_db)
+    assert "0.142 V" in chat_resp.response
+    assert "Calibration Pending" in chat_resp.response or "null" in chat_resp.response
+    assert "25" in chat_resp.response
+
+
+@pytest.mark.asyncio
+async def test_chatbot_refuses_tap_water_safety_when_uncalibrated(isolated_db, monkeypatch):
+    """Chatbot must never claim uncalibrated tap water is certified or safe to drink."""
+    from app.chatbot.agent import WaterChatbotAgent
+
+    uncal_item = ThingSpeakFeedItem(
+        entry_id=702,
+        created_at=datetime.utcnow(),
+        field1="",
+        field2="",
+        field3="",
+        field4="0",
+        field5="3.366",
+        field6="0.238",
+        field7="64",  # HEALTH_CALIBRATION_PENDING
+        field8="0.142",
+    )
+    ThingSpeakService.process_and_save_feeds(isolated_db, [uncal_item])
+
+    agent = WaterChatbotAgent()
+    monkeypatch.setattr(agent, "_get_llm_adapter", lambda: None)
+    resp = await agent.answer_query("Is this household tap water safe to drink?", isolated_db)
+    low = resp.response.lower()
+    assert "uncalibrated" in low
+    assert "do not prove" in low or "not prove" in low
+    assert "certified" in low or "laboratory" in low

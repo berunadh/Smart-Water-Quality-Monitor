@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include "../config.h"
+#include "SensorAcquisitionLogic.h"
 
 /**
  * ============================================================================
@@ -16,14 +17,16 @@
 
 enum SensorStatus {
     STATUS_OK,                    // Valid, calibrated measurement within safe range
-    STATUS_CALIBRATION_PENDING,   // Voltage is valid, but physical calibration is required
+    STATUS_CALIBRATION_PENDING,   // Voltage is valid, but verified calibration is missing
     STATUS_WARNING,               // Parameter is outside optimal safe water thresholds
     STATUS_CRITICAL,              // Parameter is at an alarming/dangerous level
     STATUS_OVER_RANGE,            // Electrical hazard: ADC reading exceeds safe limit (>3.05V)
     STATUS_DISCONNECTED,          // Probe is disconnected or reading open-circuit ground
     STATUS_STUCK,                 // Sensor output frozen without natural ADC variance
-    STATUS_UNAVAILABLE,           // Sensor hardware not present (e.g. Future TDS)
-    STATUS_ERROR                  // General sensor hardware fault
+    STATUS_UNAVAILABLE,           // Sensor hardware not present/disabled
+    STATUS_ERROR,                 // General sensor hardware fault
+    STATUS_DRY_OR_NOT_IMMERSED,   // Probe is dry / in 0-count deadzone / at dry baseline
+    STATUS_OUT_OF_CAL_RANGE       // Healthy probe reading falls outside verified calibration range
 };
 
 struct SensorReading {
@@ -57,7 +60,7 @@ public:
      * V_sensor = V_ADC * ((R1 + R2) / R2)
      */
     float adcToReconstructedVoltage(float vAdc) const {
-        return vAdc * VOLTAGE_RECONSTRUCT_FACTOR;
+        return reconstructDividerVoltage(vAdc, VOLTAGE_RECONSTRUCT_FACTOR);
     }
 
     /**
@@ -110,6 +113,85 @@ protected:
     }
 
     /**
+     * Collects trimmed-mean oversampled raw ADC counts and factory-calibrated
+     * ESP32 ADC pin voltage (via analogReadMilliVolts()), falling back to linear
+     * raw-to-volt conversion only when analogReadMilliVolts() returns 0 while
+     * raw counts > 50.
+     */
+    void sampleChannelTrimmedMilliVolts(uint8_t pin, uint8_t samples, uint16_t delayMs, float& outRaw, float& outAdcVoltage) {
+        if (samples < 5) samples = 5;
+        if (samples > 50) samples = 50;
+
+        uint16_t rawBuf[50];
+        uint32_t mvBuf[50];
+
+        for (uint8_t i = 0; i < samples; i++) {
+            rawBuf[i] = analogRead(pin);
+            mvBuf[i] = analogReadMilliVolts(pin);
+            if (delayMs > 0) delay(delayMs);
+        }
+
+        for (uint8_t i = 1; i < samples; i++) {
+            uint16_t keyR = rawBuf[i];
+            int8_t jr = i - 1;
+            while (jr >= 0 && rawBuf[jr] > keyR) {
+                rawBuf[jr + 1] = rawBuf[jr];
+                jr--;
+            }
+            rawBuf[jr + 1] = keyR;
+
+            uint32_t keyM = mvBuf[i];
+            int8_t jm = i - 1;
+            while (jm >= 0 && mvBuf[jm] > keyM) {
+                mvBuf[jm + 1] = mvBuf[jm];
+                jm--;
+            }
+            mvBuf[jm + 1] = keyM;
+        }
+
+        uint8_t trimCount = (samples * ADC_TRIM_PERCENT) / 100;
+        if (trimCount < 1) trimCount = 1;
+
+        uint32_t rawSum = 0;
+        uint64_t mvSum = 0;
+        uint8_t validCount = 0;
+
+        for (uint8_t i = trimCount; i < (samples - trimCount); i++) {
+            rawSum += rawBuf[i];
+            mvSum += mvBuf[i];
+            validCount++;
+        }
+
+        if (validCount == 0) {
+            outRaw = (float)rawBuf[samples / 2];
+            float mvFallback = (float)mvBuf[samples / 2];
+            outAdcVoltage = (mvFallback > 0.0f) ? (mvFallback / 1000.0f) : rawToAdcVoltage(outRaw);
+            return;
+        }
+
+        outRaw = (float)rawSum / (float)validCount;
+        float mvMean = (float)mvSum / (float)validCount;
+        if (mvMean > 0.0f) {
+            outAdcVoltage = adcMilliVoltsToVolts(mvMean);
+        } else if (outRaw > 50.0f) {
+            outAdcVoltage = rawToAdcVoltage(outRaw);
+        } else {
+            outAdcVoltage = 0.0f;
+        }
+    }
+
+    bool isStableVoltageFault(float currentVolts, float& previousVolts, uint8_t& consecutiveCount) const {
+        return updateAnalogStuckDetector(
+            ANALOG_STUCK_DETECTION_ENABLED,
+            currentVolts,
+            previousVolts,
+            consecutiveCount,
+            ANALOG_STUCK_MIN_DELTA_VOLTS,
+            ANALOG_STUCK_CONSECUTIVE_CYCLES
+        );
+    }
+
+    /**
      * Collects multiple oversampled readings over a stabilization window,
      * calculating the average voltage (scaled by voltageMultiplier: 2.5x for
      * divider-protected sensors, 1.0x for direct 3.3V sensors like TDS)
@@ -145,6 +227,53 @@ protected:
             varSum += diff * diff;
         }
         stdDev = sqrt(varSum / (float)sampleCount);
+        return true;
+    }
+
+    /**
+     * Captures stabilized calibration readings using factory-calibrated millivolts
+     * and reports raw ADC counts, ADC mV, reconstructed mV, and stdDev in mV.
+     */
+    bool sampleStableChannelMilliVolts(
+        uint8_t pin,
+        uint8_t sampleCount,
+        uint16_t delayMs,
+        float multiplier,
+        float& outAvgRawAdc,
+        float& outAvgAdcMv,
+        float& outAvgReconstructedMv,
+        float& outStdDevAdcMv,
+        float& outStdDevReconstructedMv
+    ) {
+        if (sampleCount < 5) sampleCount = 5;
+        if (sampleCount > 50) sampleCount = 50;
+
+        float adcMvArr[50];
+        float sumRaw = 0.0f;
+        float sumAdcMv = 0.0f;
+
+        for (uint8_t i = 0; i < sampleCount; i++) {
+            float raw = 0.0f;
+            float adcV = 0.0f;
+            sampleChannelTrimmedMilliVolts(pin, 15, 2, raw, adcV);
+            float mv = adcV * 1000.0f;
+            adcMvArr[i] = mv;
+            sumRaw += raw;
+            sumAdcMv += mv;
+            if (delayMs > 0) delay(delayMs);
+        }
+
+        outAvgRawAdc = sumRaw / (float)sampleCount;
+        outAvgAdcMv = sumAdcMv / (float)sampleCount;
+        outAvgReconstructedMv = outAvgAdcMv * multiplier;
+
+        float varSum = 0.0f;
+        for (uint8_t i = 0; i < sampleCount; i++) {
+            float diff = adcMvArr[i] - outAvgAdcMv;
+            varSum += diff * diff;
+        }
+        outStdDevAdcMv = sqrtf(varSum / (float)sampleCount);
+        outStdDevReconstructedMv = outStdDevAdcMv * multiplier;
         return true;
     }
 };

@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include "SensorBase.h"
+#include "WaterQualityScore.h"
 #include "../config.h"
 
 /**
@@ -43,6 +44,13 @@ public:
           _phViolated(false),
           _turbViolated(false),
           _tdsViolated(false) {
+        memset(&_wqsResult, 0, sizeof(_wqsResult));
+        _wqsResult.wqsValid = false;
+        _wqsResult.wqs = NAN;
+        _wqsResult.qPh = NAN;
+        _wqsResult.qTds = NAN;
+        _wqsResult.qTurb = NAN;
+        _wqsResult.waterStatusCode = WATER_STATUS_FAULT;
         _activeAlertMessage[0] = '\0';
         resetToDefaults();
     }
@@ -176,6 +184,9 @@ public:
                 setRegularThresholds(rgPhMin, rgPhMax, rgTbMax, rgTdMax, false);
             }
             prefs.end();
+        } else if (prefs.begin("watersens", false)) {
+            // Initialize namespace non-destructively if missing on first boot
+            prefs.end();
         }
         Serial.printf("[MODE] Active Water Quality Mode: %s (pH %.1f-%.1f | Turb <= %.1f NTU | TDS <= %.0f ppm)\n",
                       getModeName(),
@@ -185,7 +196,16 @@ public:
                       getActiveThresholds().tdsMax);
     }
 
-    void evaluate(const SensorReading& ph, const SensorReading& turb, const SensorReading& tds, bool wifiConnected, bool cloudOk) {
+    void evaluate(
+        const SensorReading& ph,
+        const SensorReading& turb,
+        const SensorReading& tds,
+        bool wifiConnected,
+        bool cloudOk,
+        bool tdsVerifiedCalibrated = true,
+        bool phProvisional = false,
+        bool turbProvisional = false
+    ) {
         _healthCode = HEALTH_OK;
         _severity = SEVERITY_NORMAL;
         _thresholdSeverity = SEVERITY_NORMAL;
@@ -197,13 +217,26 @@ public:
         if (FEATURE_DEMO_MODE) _healthCode |= HEALTH_DEMO_MODE_ACTIVE;
         if (_mode == MODE_REGULAR_USAGE) _healthCode |= HEALTH_MODE_REGULAR;
 
-        // 2. TDS Availability & Hardware Fault Tracking
+        // 2. TDS Availability, Dry Probe, Provisional Model, & Hardware Fault Tracking
         if (tds.status == STATUS_UNAVAILABLE) {
             _healthCode |= HEALTH_TDS_UNAVAILABLE;
+        }
+        if (tds.status == STATUS_DRY_OR_NOT_IMMERSED) {
+            _healthCode |= HEALTH_TDS_DRY;
         }
         if (tds.status == STATUS_DISCONNECTED || tds.status == STATUS_STUCK ||
             tds.status == STATUS_OVER_RANGE || tds.status == STATUS_ERROR) {
             _healthCode |= HEALTH_TDS_FAULT;
+        }
+        if (tds.isValid && !tdsVerifiedCalibrated &&
+            tds.status != STATUS_UNAVAILABLE && tds.status != STATUS_CALIBRATION_PENDING) {
+            _healthCode |= HEALTH_TDS_PROVISIONAL;
+        }
+        if (phProvisional && ph.status != STATUS_UNAVAILABLE) {
+            _healthCode |= HEALTH_PH_PROVISIONAL;
+        }
+        if (turbProvisional && turb.status != STATUS_UNAVAILABLE) {
+            _healthCode |= HEALTH_TURB_PROVISIONAL;
         }
 
         // 3. Electrical Safety & Over-Range Checks
@@ -212,7 +245,7 @@ public:
             _healthCode |= HEALTH_ADC_OVER_RANGE;
         }
 
-        // 4. Hardware Faults / Disconnected Probes
+        // 4. Genuine Hardware Faults / Disconnected Probes (distinct from Dry and Cal Pending!)
         bool hasSensorFault = false;
         if (ph.status == STATUS_DISCONNECTED || ph.status == STATUS_STUCK || ph.status == STATUS_ERROR || ph.status == STATUS_OVER_RANGE) {
             _healthCode |= HEALTH_PH_FAULT;
@@ -222,31 +255,66 @@ public:
             _healthCode |= HEALTH_TURB_FAULT;
             hasSensorFault = true;
         }
-        if (tds.status == STATUS_DISCONNECTED || tds.status == STATUS_STUCK || tds.status == STATUS_ERROR || tds.status == STATUS_OVER_RANGE) {
+        if (tds.status == STATUS_DISCONNECTED || tds.status == STATUS_STUCK ||
+            tds.status == STATUS_ERROR || tds.status == STATUS_OVER_RANGE) {
             hasSensorFault = true;
         }
 
-        // 5. Calibration Pending Flag (Any connected sensor pending calibration)
-        bool anyCalPending = (
+        // 5. Calibration Pending Flag (Any sensor lacking experimentally verified calibration)
+        bool anyMissingCurve = (
             ph.status == STATUS_CALIBRATION_PENDING ||
             turb.status == STATUS_CALIBRATION_PENDING ||
             tds.status == STATUS_CALIBRATION_PENDING
         );
+        bool anyCalPending = anyMissingCurve || phProvisional || turbProvisional;
         if (anyCalPending) {
             _healthCode |= HEALTH_CALIBRATION_PENDING;
         }
 
-        // 6. Independent Calibrated Threshold Evaluation with Hysteresis
-        // STRICT RULE: Evaluate ONLY valid, calibrated, finite readings!
+        // 6. Compute WQS & Evaluate Critical Hazard Override (Sections 7 & 8)
+        // Displayed model estimates never become WQS hazards before physical
+        // standards verify them; this also prevents provisional-only buzzers.
+        bool phMeasValid = isCalibratedValidReading(ph) && !phProvisional;
+        bool turbMeasValid = isCalibratedValidReading(turb) && !turbProvisional;
+        bool tdsMeasValid = isCalibratedValidReading(tds);
+        // Only experimentally calibrated turbidity out-of-range triggers acoustic hazard override;
+        // provisional config.h curves mismatching hardware voltage report OUT-OF-RNG without false siren.
+        bool turbOutOfCalRange = (turb.status == STATUS_OUT_OF_CAL_RANGE) && !turbProvisional;
+        bool anyOutOfRangeReading = (ph.status == STATUS_OUT_OF_CAL_RANGE || turb.status == STATUS_OUT_OF_CAL_RANGE);
+
+        _wqsResult = evaluateWaterQualityAndHazards(
+            phMeasValid, ph.calibratedValue,
+            turbMeasValid, turb.calibratedValue, turbOutOfCalRange,
+            tdsMeasValid, tds.calibratedValue,
+            hasSensorFault || hasOverRange || anyMissingCurve || anyOutOfRangeReading || (tds.status == STATUS_DRY_OR_NOT_IMMERSED),
+            FEATURE_DEMO_MODE
+        );
+
+        // 7. Independent Calibrated Threshold Evaluation with Hysteresis
+        // STRICT RULE: Evaluate ONLY valid, finite readings!
         const ModeThresholds& th = getActiveThresholds();
-        AlertSeverity phSev = evaluatePhThreshold(ph, th);
-        AlertSeverity turbSev = evaluateTurbidityThreshold(turb, th);
+        AlertSeverity phSev = phProvisional ? SEVERITY_NORMAL : evaluatePhThreshold(ph, th);
+        AlertSeverity turbSev = turbProvisional ? SEVERITY_NORMAL : evaluateTurbidityThreshold(turb, th);
+        if (phProvisional) _phViolated = false;
+        if (turbProvisional) _turbViolated = false;
         AlertSeverity tdsSev = evaluateTdsThreshold(tds, th);
 
         // Max calibrated threshold violation severity (drives buzzer strictly!)
         _thresholdSeverity = phSev;
         if (turbSev > _thresholdSeverity) _thresholdSeverity = turbSev;
         if (tdsSev > _thresholdSeverity)  _thresholdSeverity = tdsSev;
+
+        // 8. Critical Hazard Override takes precedence over normal alerts (Section 8)
+        // Never fires on disconnected, missing, or hardware acquisition failures.
+        if (_wqsResult.criticalHazard) {
+            _severity = SEVERITY_CRITICAL;
+            _thresholdSeverity = SEVERITY_CRITICAL;
+            if (_wqsResult.hazardPh)   _phViolated = true;
+            if (_wqsResult.hazardTds)  _tdsViolated = true;
+            if (_wqsResult.hazardTurb || _wqsResult.hazardTurbRange) _turbViolated = true;
+            buildHazardMessage();
+            return;
+        }
 
         // Build exact alert description identifying every violated parameter
         if (hasThresholdViolation()) {
@@ -267,19 +335,34 @@ public:
             snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "PROBE DISCONNECTED");
             return;
         }
+        if (tds.status == STATUS_DRY_OR_NOT_IMMERSED) {
+            _severity = SEVERITY_NORMAL;
+            snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "TDS DRY / NOT IMMERSED");
+            return;
+        }
+        if (ph.status == STATUS_OUT_OF_CAL_RANGE || turb.status == STATUS_OUT_OF_CAL_RANGE) {
+            _severity = SEVERITY_SENSOR_FAULT;
+            snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "OUT OF CAL RANGE");
+            return;
+        }
+        if (anyMissingCurve) {
+            _severity = SEVERITY_NORMAL;
+            snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "CAL CONSTANTS NEEDED");
+            return;
+        }
         if (anyCalPending) {
             _severity = SEVERITY_NORMAL;
-            snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "CALIBRATION PENDING");
+            snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "PROVISIONAL ESTIMATE");
             return;
         }
 
-        // All calibrated sensors valid and within active mode thresholds
+        // All valid sensors within active mode thresholds
         _severity = SEVERITY_NORMAL;
-        snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "WATER SYSTEM NORMAL");
+        snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "WATER %s", getWaterStatusName(_wqsResult.waterStatusCode));
     }
 
     bool shouldSoundBuzzer() const {
-        return hasThresholdViolation() && (_thresholdSeverity >= SEVERITY_WARNING);
+        return (_wqsResult.criticalHazard || hasThresholdViolation()) && (_thresholdSeverity >= SEVERITY_WARNING);
     }
 
     bool hasThresholdViolation() const {
@@ -289,6 +372,15 @@ public:
     bool isPhViolated() const { return _phViolated; }
     bool isTurbViolated() const { return _turbViolated; }
     bool isTdsViolated() const { return _tdsViolated; }
+
+    bool isWqsValid() const { return _wqsResult.wqsValid; }
+    float getWqs() const { return _wqsResult.wqs; }
+    float getSubIndexPh() const { return _wqsResult.qPh; }
+    float getSubIndexTds() const { return _wqsResult.qTds; }
+    float getSubIndexTurb() const { return _wqsResult.qTurb; }
+    bool isCriticalHazard() const { return _wqsResult.criticalHazard; }
+    int getWaterStatusCode() const { return _wqsResult.waterStatusCode; }
+    const char* getWaterStatusLabel() const { return getWaterStatusName(_wqsResult.waterStatusCode); }
 
     AlertSeverity getSeverity() const { return _severity; }
     AlertSeverity getThresholdSeverity() const { return _thresholdSeverity; }
@@ -315,6 +407,7 @@ private:
     bool _phViolated;
     bool _turbViolated;
     bool _tdsViolated;
+    WqsEvaluationResult _wqsResult;
     char _activeAlertMessage[32];
 
     static bool isCalibratedValidReading(const SensorReading& r) {
@@ -323,9 +416,11 @@ private:
             r.status != STATUS_CALIBRATION_PENDING &&
             r.status != STATUS_UNAVAILABLE &&
             r.status != STATUS_DISCONNECTED &&
+            r.status != STATUS_DRY_OR_NOT_IMMERSED &&
             r.status != STATUS_OVER_RANGE &&
             r.status != STATUS_STUCK &&
             r.status != STATUS_ERROR &&
+            r.status != STATUS_OUT_OF_CAL_RANGE &&
             !isnan(r.calibratedValue) &&
             !isinf(r.calibratedValue)
         );
@@ -409,6 +504,15 @@ private:
         if (_turbViolated) msg += (msg.length() > 0 ? "+TURB" : "TURB");
         if (_tdsViolated)  msg += (msg.length() > 0 ? "+TDS" : "TDS");
         msg += " EXCEEDED";
+        snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "%s", msg.c_str());
+    }
+
+    void buildHazardMessage() {
+        String msg = "HAZARD:";
+        if (_wqsResult.hazardPh)        msg += " pH";
+        if (_wqsResult.hazardTds)       msg += " TDS";
+        if (_wqsResult.hazardTurb)      msg += " TURB";
+        if (_wqsResult.hazardTurbRange) msg += " TURB-RNG";
         snprintf(_activeAlertMessage, sizeof(_activeAlertMessage), "%s", msg.c_str());
     }
 };

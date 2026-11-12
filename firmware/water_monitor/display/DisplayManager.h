@@ -109,55 +109,67 @@ private:
                          const SensorValidator& validator,
                          bool wifiConnected,
                          const char* cloudStatus) {
+        bool anyUncalibrated = (
+            ph.status == STATUS_CALIBRATION_PENDING ||
+            turb.status == STATUS_CALIBRATION_PENDING ||
+            tds.status == STATUS_CALIBRATION_PENDING
+        );
         AlertSeverity sev = validator.getSeverity();
-        const char* sevTag = "NORM";
-        if (sev == SEVERITY_WARNING) sevTag = "WARN";
-        else if (sev == SEVERITY_CRITICAL) sevTag = "CRIT";
-        else if (sev == SEVERITY_SENSOR_FAULT) sevTag = "FLT!";
+        const char* statusTag = validator.getWaterStatusLabel();
+        if (validator.isCriticalHazard()) {
+            statusTag = "HAZARD!";
+        } else if (anyUncalibrated && sev == SEVERITY_NORMAL) {
+            statusTag = "CAL";
+        } else if (tds.status == STATUS_DRY_OR_NOT_IMMERSED && sev == SEVERITY_NORMAL) {
+            statusTag = "DRY";
+        }
 
-        // Header Bar
-        if (sev >= SEVERITY_WARNING && _flashState) {
-            // Inverted header to catch attention during alert
-            _display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+        // Header Bar (flashing inverted bar during warning/critical/hazard)
+        if ((sev >= SEVERITY_WARNING || validator.isCriticalHazard()) && _flashState) {
+            _display.fillRect(0, 0, 128, 11, SSD1306_WHITE);
             _display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
             _display.setTextSize(1);
             _display.setCursor(2, 2);
-            _display.printf("%s: %.16s", validator.getModeShortTag(), validator.getAlertMessage());
+            _display.printf("%.20s", validator.getAlertMessage());
             _display.setTextColor(SSD1306_WHITE);
         } else {
             _display.setTextSize(1);
-            _display.setCursor(0, 0);
-            _display.printf("HYDROSENSE [%s]", validator.getModeShortTag());
-            _display.setCursor(92, 0);
-            _display.printf("[%s]", sevTag);
+            _display.setCursor(0, 1);
+            _display.printf("HYDRO[%s]", validator.getModeShortTag());
+            _display.setCursor(74, 1);
+            _display.printf("[%s]", statusTag);
             _display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
         }
 
         // 1. pH Reading
-        _display.setCursor(0, 14);
-        _display.print(F("pH  : "));
+        _display.setCursor(0, 13);
+        _display.print(F("pH  :"));
         if (ph.status == STATUS_OVER_RANGE) {
             _display.print(F("OVER-RANGE!"));
         } else if (ph.status == STATUS_DISCONNECTED) {
-            _display.print(F("DISCONNECTED"));
+            _display.print(F("FAULT/0V"));
+        } else if (ph.status == STATUS_OUT_OF_CAL_RANGE) {
+            _display.printf("OUT-RNG(%.2fV)", ph.reconstructedVoltage);
         } else if (ph.status == STATUS_CALIBRATION_PENDING || isnan(ph.calibratedValue)) {
-            _display.printf("CAL PEND(%.2fV)", ph.reconstructedVoltage);
+            _display.print(F("--"));
         } else if (ph.isValid) {
-            _display.printf("%.2f (%.2fV)%s", ph.calibratedValue, ph.reconstructedVoltage,
+            _display.printf("%.2f%s", ph.calibratedValue,
                             validator.isPhViolated() ? "!" : "");
         } else {
             _display.print(F("FAULT"));
         }
 
         // 2. Turbidity Reading
-        _display.setCursor(0, 26);
-        _display.print(F("Turb: "));
+        _display.setCursor(0, 22);
+        _display.print(F("Turb:"));
         if (turb.status == STATUS_OVER_RANGE) {
             _display.print(F("OVER-RANGE!"));
         } else if (turb.status == STATUS_DISCONNECTED) {
-            _display.print(F("DISCONNECTED"));
+            _display.print(F("FAULT/0V"));
+        } else if (turb.status == STATUS_OUT_OF_CAL_RANGE) {
+            _display.printf("OUT-RNG!(%.2fV)", turb.reconstructedVoltage);
         } else if (turb.status == STATUS_CALIBRATION_PENDING || isnan(turb.calibratedValue)) {
-            _display.printf("CAL PEND(%.2fV)", turb.reconstructedVoltage);
+            _display.printf("UNCAL (%.2fV)", turb.reconstructedVoltage);
         } else if (turb.isValid) {
             _display.printf("%.1fNTU(%.2fV)%s", turb.calibratedValue, turb.reconstructedVoltage,
                             validator.isTurbViolated() ? "!" : "");
@@ -165,22 +177,34 @@ private:
             _display.print(F("FAULT"));
         }
 
-        // 3. TDS Reading (Direct 3.3V ADC; strictly N/A or CAL PEND until calibrated)
-        _display.setCursor(0, 38);
-        _display.print(F("TDS : "));
+        // 3. TDS Reading (Direct 3.3V ADC)
+        _display.setCursor(0, 31);
+        _display.print(F("TDS :"));
         if (tds.status == STATUS_UNAVAILABLE) {
             _display.print(F("N/A (DISABLED)"));
         } else if (tds.status == STATUS_OVER_RANGE) {
             _display.print(F("OVER-RANGE!"));
         } else if (tds.status == STATUS_DISCONNECTED) {
-            _display.printf("NO SIG (%.2fV)", tds.adcVoltage);
+            _display.printf("FAULT (%.2fV)", tds.adcVoltage);
+        } else if (tds.status == STATUS_DRY_OR_NOT_IMMERSED) {
+            _display.printf("DRY (%.2fV)", tds.adcVoltage);
         } else if (tds.status == STATUS_CALIBRATION_PENDING || isnan(tds.calibratedValue)) {
-            _display.printf("CAL PEND(%.2fV)", tds.adcVoltage);
+            _display.printf("UNCAL (%.2fV)", tds.adcVoltage);
         } else if (tds.isValid) {
             _display.printf("%.0fppm(%.2fV)%s", tds.calibratedValue, tds.adcVoltage,
                             validator.isTdsViolated() ? "!" : "");
         } else {
             _display.print(F("FAULT"));
+        }
+
+        // 4. Water Quality Score (WQS) & Overall Status
+        _display.setCursor(0, 40);
+        if (validator.isWqsValid()) {
+            _display.printf("WQS :%.1f [%s]", validator.getWqs(), statusTag);
+        } else if (validator.isCriticalHazard()) {
+            _display.printf("WQS :<=20 [%s]", statusTag);
+        } else {
+            _display.printf("WQS :N/A [%s]", statusTag);
         }
 
         // Bottom Status Bar
@@ -190,7 +214,7 @@ private:
     }
 
     /**
-     * PAGE 1: Electrical & Voltage Diagnostics
+     * PAGE 1: Electrical, Sub-Index & Voltage Diagnostics
      */
     void renderDiagnostics(const SensorReading& ph, 
                           const SensorReading& turb, 
@@ -200,21 +224,28 @@ private:
                           const char* cloudStatus) {
         // Header
         _display.setTextSize(1);
-        _display.setCursor(0, 0);
-        _display.printf("VOLTS [%s]     P2/2", validator.getModeShortTag());
+        _display.setCursor(0, 1);
+        _display.printf("DIAG [%s]      P2/2", validator.getModeShortTag());
         _display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
 
         // pH Electrical
-        _display.setCursor(0, 14);
-        _display.printf("pH  :%.3fV -> %.2fV", ph.adcVoltage, ph.reconstructedVoltage);
+        _display.setCursor(0, 13);
+        _display.printf("pH :%.2f->%.2fV q:%s", ph.adcVoltage, ph.reconstructedVoltage,
+                        isnan(validator.getSubIndexPh()) ? "--" : String(validator.getSubIndexPh(), 0).c_str());
 
         // Turbidity Electrical
-        _display.setCursor(0, 26);
-        _display.printf("Turb:%.3fV -> %.2fV", turb.adcVoltage, turb.reconstructedVoltage);
+        _display.setCursor(0, 22);
+        _display.printf("Tb :%.2f->%.2fV q:%s", turb.adcVoltage, turb.reconstructedVoltage,
+                        isnan(validator.getSubIndexTurb()) ? "--" : String(validator.getSubIndexTurb(), 0).c_str());
 
         // TDS Electrical (Direct 3.3V - No Divider)
-        _display.setCursor(0, 38);
-        _display.printf("TDS :%.3fV (Direct)", tds.adcVoltage);
+        _display.setCursor(0, 31);
+        _display.printf("TDS:%.2fV(1x)   q:%s", tds.adcVoltage,
+                        isnan(validator.getSubIndexTds()) ? "--" : String(validator.getSubIndexTds(), 0).c_str());
+
+        // Water Status Code
+        _display.setCursor(0, 40);
+        _display.printf("St:%d (%s)", validator.getWaterStatusCode(), validator.getWaterStatusLabel());
 
         // Safety & Health Code Bitmask
         bool hazard = (ph.adcVoltage >= ADC_OVER_RANGE_VOLTS ||

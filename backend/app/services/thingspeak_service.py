@@ -63,15 +63,18 @@ class ThingSpeakService:
         cls,
         db: Session,
         feed_items: List[ThingSpeakFeedItem],
+        field_profile: Optional[str] = None,
     ) -> ThingSpeakSyncResult:
         """
         Parses raw ThingSpeak feeds, enforces data contracts, validates electrical
         invariants, and commits new non-duplicate records to the database.
+        Supports default '8field' (Channel 3570138) and optional '5field' documented mapping.
         """
         new_count = 0
         failure_count = 0
         latest_id = None
         mode_config = ModeService.get_or_create_config(db)
+        profile = (field_profile or getattr(settings, "THINGSPEAK_FIELD_PROFILE", "8field")).lower()
 
         for item in feed_items:
             # Prevent duplicate entries via entry_id
@@ -79,20 +82,38 @@ class ThingSpeakService:
             if existing:
                 continue
 
-            # Parse Fields (strictly preserve None for uncalibrated/missing values)
-            ph = ValidationService.parse_float_field(item.field1)
-            turbidity = ValidationService.parse_float_field(item.field2)
-            tds = ValidationService.parse_float_field(item.field3)
-            severity = ValidationService.parse_int_field(item.field4, default=0)
-            ph_v = ValidationService.parse_float_field(item.field5) or 0.0
-            turb_v = ValidationService.parse_float_field(item.field6) or 0.0
-            health = ValidationService.parse_int_field(item.field7, default=0)
-            tds_v = ValidationService.parse_float_field(item.field8)
+            if profile == "5field":
+                # Documented 5-field design mapping:
+                # field1=TDS ppm, field2=pH, field3=Turbidity NTU, field4=Custom WQS, field5=System status code
+                tds = ValidationService.parse_float_field(item.field1)
+                ph = ValidationService.parse_float_field(item.field2)
+                turbidity = ValidationService.parse_float_field(item.field3)
+                status_code = ValidationService.parse_int_field(item.field5, default=-1)
+                severity = 2 if status_code == 0 else (3 if status_code == -1 else (1 if status_code in (1, 2) else 0))
+                ph_v = 0.0
+                turb_v = 0.0
+                health = (1 << 2) if status_code == -1 else 0
+                tds_v = None
+            else:
+                # Default 8-field project mapping (Channel ID 3570138)
+                ph = ValidationService.parse_float_field(item.field1)
+                turbidity = ValidationService.parse_float_field(item.field2)
+                tds = ValidationService.parse_float_field(item.field3)
+                severity = ValidationService.parse_int_field(item.field4, default=0)
+                ph_v = ValidationService.parse_float_field(item.field5) or 0.0
+                turb_v = ValidationService.parse_float_field(item.field6) or 0.0
+                health = ValidationService.parse_int_field(item.field7, default=0)
+                tds_v = ValidationService.parse_float_field(item.field8)
 
-            # Calibration flags: If field was sent, probe is calibrated; otherwise pending
-            ph_cal = (ph is not None)
-            turb_cal = (turbidity is not None)
-            tds_cal = (tds is not None)
+            # Calibration vs Provisional flags:
+            # Bits 11/12/13 indicate provisional estimates/models without experimental NVS confirmation.
+            ph_prov = bool(health & (1 << 12))
+            turb_prov = bool(health & (1 << 13))
+            tds_prov = bool(health & (1 << 11))
+            ph_cal = (ph is not None) and (not ph_prov)
+            turb_cal = (turbidity is not None) and (not turb_prov)
+            tds_cal = (tds is not None) and (not tds_prov)
+            item_ts = ValidationService.to_naive_utc(item.created_at) or datetime.utcnow()
 
             is_valid, is_stale, notes = ValidationService.validate_reading(
                 ph=ph,
@@ -101,7 +122,7 @@ class ThingSpeakService:
                 ph_board_v=ph_v,
                 turbidity_board_v=turb_v,
                 health_code=health,
-                timestamp=item.created_at,
+                timestamp=item_ts,
                 tds_voltage=tds_v,
             )
 
@@ -111,7 +132,7 @@ class ThingSpeakService:
             record = WaterReadingModel(
                 entry_id=item.entry_id,
                 device_id=settings.DEVICE_ID,
-                timestamp=item.created_at,
+                timestamp=item_ts,
                 ph=ph,
                 turbidity=turbidity,
                 tds=tds,  # STRICT: Remains None if omitted/uncalibrated
@@ -163,7 +184,7 @@ class ThingSpeakService:
             # Add to Alert Log ONLY for threshold breaches or electrical/sensor faults (never calibration pending)
             if record.alert_severity > 0:
                 alert_log = AlertLogModel(
-                    timestamp=item.created_at,
+                    timestamp=item_ts,
                     severity=record.alert_severity,
                     title=f"{evaluation.mode_label.upper()} ALERT" if evaluation.violated_parameters else record.sensor_health_summary,
                     message=record.alert_messages,
@@ -182,3 +203,18 @@ class ThingSpeakService:
             validation_failures=failure_count,
             latest_entry_id=latest_id,
         )
+
+    @classmethod
+    async def sync_latest_to_db(cls, db: Session, results: int = 50) -> Optional[ThingSpeakSyncResult]:
+        """Convenience async helper to fetch recent ThingSpeak feeds and persist new entries."""
+        channel_id = str(settings.THINGSPEAK_CHANNEL_ID)
+        if not channel_id or channel_id in ("0", "YOUR_CHANNEL_ID"):
+            return None
+        feed_response = await cls.fetch_feeds(
+            channel_id=channel_id,
+            read_api_key=settings.THINGSPEAK_READ_API_KEY,
+            results=results,
+        )
+        if not feed_response:
+            return None
+        return cls.process_and_save_feeds(db, feed_response.feeds)

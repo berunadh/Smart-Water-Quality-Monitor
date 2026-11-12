@@ -320,15 +320,21 @@ export const ThresholdSettingsPanel: React.FC<ThresholdSettingsPanelProps> = ({
           <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-bold text-slate-800">pH (GPIO34)</span>
-              <span className={calibration?.ph_calibrated ? 'text-emerald-600 font-semibold' : 'text-amber-600 font-semibold'}>
-                {calibration?.ph_calibrated ? 'Calibrated' : 'Pending'}
+              <span className={
+                calibration?.ph_calibrated
+                  ? 'text-emerald-600 font-semibold'
+                  : calibration?.ph_provisional
+                  ? 'text-sky-600 font-semibold'
+                  : 'text-amber-600 font-semibold'
+              }>
+                {calibration?.ph_calibrated ? 'Calibrated' : calibration?.ph_provisional ? 'Provisional' : 'Pending'}
               </span>
             </div>
             <div className="text-slate-600 font-mono">
               Board: {(calibration?.ph_voltage ?? 0).toFixed(3)} V
             </div>
             <div className="text-[11px] text-slate-500">
-              CLI: <code>ph cal 7.00</code> → <code>ph cal 4.01</code> → <code>ph confirm</code>
+              CLI: <code>ph cal 4.01</code> / <code>7.00</code> / <code>9.18</code> → <code>ph confirm</code>
             </div>
           </div>
 
@@ -336,15 +342,21 @@ export const ThresholdSettingsPanel: React.FC<ThresholdSettingsPanelProps> = ({
           <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-bold text-slate-800">Turbidity (GPIO32)</span>
-              <span className={calibration?.turbidity_calibrated ? 'text-emerald-600 font-semibold' : 'text-amber-600 font-semibold'}>
-                {calibration?.turbidity_calibrated ? 'Calibrated' : 'Pending'}
+              <span className={
+                calibration?.turbidity_calibrated
+                  ? 'text-emerald-600 font-semibold'
+                  : calibration?.turbidity_provisional
+                  ? 'text-sky-600 font-semibold'
+                  : 'text-amber-600 font-semibold'
+              }>
+                {calibration?.turbidity_calibrated ? 'Calibrated' : calibration?.turbidity_provisional ? 'Provisional' : 'Pending'}
               </span>
             </div>
             <div className="text-slate-600 font-mono">
               Board: {(calibration?.turbidity_voltage ?? 0).toFixed(3)} V
             </div>
             <div className="text-[11px] text-slate-500">
-              CLI: <code>turb cal clear</code> → <code>turb cal 100</code> → <code>turb confirm</code>
+              CLI: <code>turb cal clear &lt;ntu&gt;</code> → <code>turb cal std &lt;ntu&gt;</code> → <code>turb confirm</code>
             </div>
           </div>
 
@@ -352,8 +364,8 @@ export const ThresholdSettingsPanel: React.FC<ThresholdSettingsPanelProps> = ({
           <div className="p-3.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-bold text-slate-800">TDS (GPIO35)</span>
-              <span className={calibration?.tds_calibrated ? 'text-emerald-600 font-semibold' : 'text-amber-600 font-semibold'}>
-                {calibration?.tds_calibrated ? 'Calibrated' : 'Pending'}
+              <span className={calibration?.tds_calibrated ? 'text-emerald-600 font-semibold' : 'text-sky-600 font-semibold'}>
+                {calibration?.tds_calibrated ? 'Calibrated' : 'Provisional'}
               </span>
             </div>
             <div className="text-slate-600 font-mono">
@@ -362,7 +374,7 @@ export const ThresholdSettingsPanel: React.FC<ThresholdSettingsPanelProps> = ({
                 : 'N/A'}
             </div>
             <div className="text-[11px] text-slate-500">
-              CLI: <code>tds cal 342</code> → <code>tds confirm</code>
+              CLI: <code>tds verify 342</code> → <code>tds confirm</code> (optional kFactor; 25°C nom.)
             </div>
           </div>
         </div>

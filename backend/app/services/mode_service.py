@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models.water_quality_config import WaterQualityConfigModel
 from app.models.water_reading import WaterReadingModel
+from app.services.wqs_service import WqsService
 from app.schemas.mode import (
     WaterQualityModeLiteral,
     ModeThresholdProfile,
@@ -133,11 +134,27 @@ class ModeService:
         any_uncalibrated = False
         has_fault = (not reading.is_valid) or bool(reading.health_code & (1 << 4))
 
-        # 1. pH evaluation
+        # 1. pH evaluation (distinguishes disconnected vs fault vs provisional vs calibration pending)
+        ph_disconnected = bool(reading.health_code & (1 << 2)) and ((reading.ph_voltage * 0.40) < 0.08)
         ph_fault = bool(reading.health_code & (1 << 2)) or (
             not reading.is_valid and (reading.ph is None or (reading.ph_voltage * 0.40 >= 3.05))
         )
-        if ph_fault:
+        ph_prov_flag = bool(reading.health_code & (1 << 12))
+        ph_provisional = (ph_prov_flag or (not reading.ph_calibrated)) and reading.ph is not None
+        if ph_prov_flag or (not reading.ph_calibrated):
+            any_uncalibrated = True
+
+        if ph_disconnected:
+            param_evals["ph"] = ParameterEvaluation(
+                parameter="pH",
+                status="disconnected",
+                value=None,
+                unit="pH",
+                limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
+                message="pH probe disconnected or reading ~0V.",
+            )
+            has_fault = True
+        elif ph_fault:
             param_evals["ph"] = ParameterEvaluation(
                 parameter="pH",
                 status="fault",
@@ -147,18 +164,33 @@ class ModeService:
                 message="pH sensor fault or electrical out-of-range.",
             )
             has_fault = True
-        elif not reading.ph_calibrated or reading.ph is None:
+        elif reading.ph is None or (not reading.ph_calibrated and not ph_provisional):
             any_uncalibrated = True
+            ph_msg = (
+                "pH is a model-based provisional estimate; buffer calibration is still required."
+                if ph_prov_flag
+                else "pH calibration pending (E201-C buffers and measured board voltages required)."
+            )
             param_evals["ph"] = ParameterEvaluation(
                 parameter="pH",
                 status="uncalibrated",
                 value=None,
                 unit="pH",
                 limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
-                message="pH calibration pending (buffer calibration required).",
+                message=ph_msg,
+            )
+        elif ph_provisional:
+            param_evals["ph"] = ParameterEvaluation(
+                parameter="pH",
+                status="provisional",
+                value=reading.ph,
+                unit="pH",
+                limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
+                message="Model-based pH estimate; not used for threshold alerts until buffer-verified.",
             )
         else:
             v = reading.ph
+            prov_note = " (provisional estimate)" if ph_provisional else ""
             margin = min(0.2, (profile.ph_max - profile.ph_min) * 0.1)
             if v < profile.ph_min or v > profile.ph_max:
                 violated.append(f"pH ({v:.2f}) exceeded the allowed range ({profile.ph_min:.1f}–{profile.ph_max:.1f})")
@@ -170,7 +202,7 @@ class ModeService:
                     value=v,
                     unit="pH",
                     limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
-                    message=f"pH ({v:.2f}) exceeded allowed range.",
+                    message=f"pH ({v:.2f}) exceeded allowed range{prov_note}.",
                 )
             elif v < profile.ph_min + margin or v > profile.ph_max - margin:
                 param_evals["ph"] = ParameterEvaluation(
@@ -179,7 +211,7 @@ class ModeService:
                     value=v,
                     unit="pH",
                     limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
-                    message=f"pH ({v:.2f}) approaching mode limit.",
+                    message=f"pH ({v:.2f}) approaching mode limit{prov_note}.",
                 )
             else:
                 param_evals["ph"] = ParameterEvaluation(
@@ -188,35 +220,66 @@ class ModeService:
                     value=v,
                     unit="pH",
                     limit_text=f"{profile.ph_min:.1f}–{profile.ph_max:.1f}",
-                    message=f"pH ({v:.2f}) within limits.",
+                    message=f"pH ({v:.2f}) within limits{prov_note}.",
                 )
 
-        # 2. Turbidity evaluation
+        # 2. Turbidity evaluation (distinguishes disconnected vs fault vs provisional vs calibration pending)
+        turb_disconnected = bool(reading.health_code & (1 << 3)) and ((reading.turbidity_voltage * 0.40) < 0.08)
         turb_fault = bool(reading.health_code & (1 << 3)) or (
             not reading.is_valid and (reading.turbidity is None or (reading.turbidity_voltage * 0.40 >= 3.05))
         )
-        if turb_fault:
+        turb_prov_flag = bool(reading.health_code & (1 << 13))
+        turb_provisional = (turb_prov_flag or (not reading.turbidity_calibrated)) and reading.turbidity is not None
+        if turb_prov_flag or (not reading.turbidity_calibrated):
+            any_uncalibrated = True
+
+        if turb_disconnected:
+            param_evals["turbidity"] = ParameterEvaluation(
+                parameter="Turbidity",
+                status="disconnected",
+                value=None,
+                unit="NTU",
+                limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
+                message="Turbidity probe disconnected (~0V; not clear water).",
+            )
+            has_fault = True
+        elif turb_fault:
             param_evals["turbidity"] = ParameterEvaluation(
                 parameter="Turbidity",
                 status="fault",
                 value=None,
                 unit="NTU",
                 limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
-                message="Turbidity sensor fault or disconnected.",
+                message="Turbidity sensor fault or out-of-range.",
             )
             has_fault = True
-        elif not reading.turbidity_calibrated or reading.turbidity is None:
+        elif reading.turbidity is None or (not reading.turbidity_calibrated and not turb_provisional):
             any_uncalibrated = True
+            turb_msg = (
+                "Turbidity is a model-based provisional estimate; certified standards are still required."
+                if turb_prov_flag
+                else "Turbidity calibration pending (actual optical-module standards required)."
+            )
             param_evals["turbidity"] = ParameterEvaluation(
                 parameter="Turbidity",
                 status="uncalibrated",
                 value=None,
                 unit="NTU",
                 limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
-                message="Turbidity calibration pending.",
+                message=turb_msg,
+            )
+        elif turb_provisional:
+            param_evals["turbidity"] = ParameterEvaluation(
+                parameter="Turbidity",
+                status="provisional",
+                value=reading.turbidity,
+                unit="NTU",
+                limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
+                message="Provisional reference-anchor NTU estimate; certified standards still required.",
             )
         else:
             v = reading.turbidity
+            prov_note = " (provisional estimate)" if turb_provisional else ""
             warn_floor = profile.turbidity_max * 0.85
             if v > profile.turbidity_max:
                 violated.append(
@@ -230,7 +293,7 @@ class ModeService:
                     value=v,
                     unit="NTU",
                     limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
-                    message=f"Turbidity ({v:.2f} NTU) exceeded threshold.",
+                    message=f"Turbidity ({v:.2f} NTU) exceeded threshold{prov_note}.",
                 )
             elif v > warn_floor:
                 param_evals["turbidity"] = ParameterEvaluation(
@@ -239,7 +302,7 @@ class ModeService:
                     value=v,
                     unit="NTU",
                     limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
-                    message=f"Turbidity ({v:.2f} NTU) approaching limit.",
+                    message=f"Turbidity ({v:.2f} NTU) approaching limit{prov_note}.",
                 )
             else:
                 param_evals["turbidity"] = ParameterEvaluation(
@@ -248,11 +311,13 @@ class ModeService:
                     value=v,
                     unit="NTU",
                     limit_text=f"≤ {profile.turbidity_max:.1f} NTU",
-                    message=f"Turbidity ({v:.2f} NTU) within limit.",
+                    message=f"Turbidity ({v:.2f} NTU) within limit{prov_note}.",
                 )
 
-        # 3. TDS evaluation
+        # 3. TDS evaluation (distinguishes valid, provisional, dry, disconnected, fault, unavailable, pending)
         tds_unavailable = bool(reading.health_code & (1 << 5)) and reading.tds is None and not reading.tds_calibrated
+        tds_dry = bool(reading.health_code & (1 << 10)) and reading.tds is None
+        tds_provisional = bool(reading.health_code & (1 << 11)) and reading.tds is not None
         tds_fault = bool(reading.health_code & (1 << 8)) or (
             reading.tds_voltage is not None and reading.tds_voltage >= 3.05
         )
@@ -266,6 +331,15 @@ class ModeService:
                 message="TDS probe disconnected or out-of-range.",
             )
             has_fault = True
+        elif tds_dry:
+            param_evals["tds"] = ParameterEvaluation(
+                parameter="TDS",
+                status="dry",
+                value=None,
+                unit="mg/L",
+                limit_text=f"≤ {profile.tds_max:.0f} mg/L",
+                message="TDS probe dry / not immersed (never 0 ppm).",
+            )
         elif tds_unavailable and reading.tds_voltage is None:
             any_uncalibrated = True
             param_evals["tds"] = ParameterEvaluation(
@@ -274,9 +348,9 @@ class ModeService:
                 value=None,
                 unit="mg/L",
                 limit_text=f"≤ {profile.tds_max:.0f} mg/L",
-                message="TDS unavailable or uncalibrated (GPIO35).",
+                message="TDS unavailable or disabled (GPIO35).",
             )
-        elif not reading.tds_calibrated or reading.tds is None:
+        elif (not reading.tds_calibrated and not tds_provisional) or reading.tds is None:
             any_uncalibrated = True
             param_evals["tds"] = ParameterEvaluation(
                 parameter="TDS",
@@ -288,6 +362,7 @@ class ModeService:
             )
         else:
             v = reading.tds
+            prov_note = " (provisional 25°C polynomial)" if tds_provisional else ""
             warn_floor = profile.tds_max * 0.90
             if v > profile.tds_max:
                 violated.append(f"TDS ({v:.0f} mg/L) exceeded the selected threshold (≤ {profile.tds_max:.0f} mg/L)")
@@ -299,7 +374,7 @@ class ModeService:
                     value=v,
                     unit="mg/L",
                     limit_text=f"≤ {profile.tds_max:.0f} mg/L",
-                    message=f"TDS ({v:.0f} mg/L) exceeded threshold.",
+                    message=f"TDS ({v:.0f} mg/L) exceeded threshold{prov_note}.",
                 )
             elif v > warn_floor:
                 param_evals["tds"] = ParameterEvaluation(
@@ -308,7 +383,7 @@ class ModeService:
                     value=v,
                     unit="mg/L",
                     limit_text=f"≤ {profile.tds_max:.0f} mg/L",
-                    message=f"TDS ({v:.0f} mg/L) approaching limit.",
+                    message=f"TDS ({v:.0f} mg/L) approaching limit{prov_note}.",
                 )
             else:
                 param_evals["tds"] = ParameterEvaluation(
@@ -317,13 +392,46 @@ class ModeService:
                     value=v,
                     unit="mg/L",
                     limit_text=f"≤ {profile.tds_max:.0f} mg/L",
-                    message=f"TDS ({v:.0f} mg/L) within limit.",
+                    message=f"TDS ({v:.0f} mg/L) within limit{prov_note}.",
                 )
+
+        # Evaluate WQS & Critical Hazard Override (Sections 7 & 8)
+        ph_valid_meas = (not ph_fault) and reading.ph_calibrated and (reading.ph is not None)
+        turb_valid_meas = (not turb_fault) and reading.turbidity_calibrated and (reading.turbidity is not None)
+        tds_valid_meas = (not tds_fault) and (not tds_dry) and (not tds_unavailable) and (reading.tds_calibrated or tds_provisional) and (reading.tds is not None)
+        alert_txt = ((reading.alert_messages or "") + " " + (reading.validation_notes or "")).upper()
+        turb_out_of_cal_range = (
+            ("OUT OF CAL RANGE" in alert_txt or "TURB-RNG" in alert_txt)
+            and (not turb_fault)
+            and (not turb_prov_flag)
+        )
+
+        # Only missing readings or hardware faults/dry probe invalidate WQS;
+        # provisional estimates with all 3 valid numeric values can compute provisional WQS
+        # while HEALTH_CALIBRATION_PENDING keeps experimental status pending.
+        missing_numeric = (reading.ph is None) or (reading.turbidity is None) or (reading.tds is None)
+        wqs_res = WqsService.evaluate(
+            ph_valid=ph_valid_meas,
+            ph=reading.ph,
+            turb_valid=turb_valid_meas,
+            turbidity=reading.turbidity,
+            tds_valid=tds_valid_meas,
+            tds=reading.tds,
+            turb_out_of_cal_range=turb_out_of_cal_range,
+            any_hardware_fault=has_fault or missing_numeric or tds_dry,
+        )
+
+        if wqs_res.critical_hazard:
+            max_severity = 2
+            for reason in wqs_res.hazard_reasons:
+                if reason not in violated:
+                    violated.append(reason)
 
         # Determine overall status
         has_warning_param = any(e.status == "warning" for e in param_evals.values())
-        if max_severity >= 2:
+        if max_severity >= 2 or wqs_res.critical_hazard:
             overall_status = "CRITICAL"
+            max_severity = 2
         elif max_severity == 1:
             overall_status = "EXCEEDED"
         elif has_fault:
@@ -344,13 +452,36 @@ class ModeService:
             violated_parameters=violated,
             parameter_evaluations=param_evals,
             preliminary_disclaimer=disclaimer,
+            wqs=wqs_res.wqs,
+            q_ph=wqs_res.q_ph,
+            q_turb=wqs_res.q_turb,
+            q_tds=wqs_res.q_tds,
+            water_status_code=wqs_res.water_status_code,
+            water_status_label=wqs_res.water_status_label,
+            critical_hazard=wqs_res.critical_hazard,
+            hazard_reasons=wqs_res.hazard_reasons,
         )
+
+    @staticmethod
+    def get_latest_preferred_reading(db: Session) -> Optional[WaterReadingModel]:
+        """Returns latest real reading when DATA_MODE=='real' and real data exists; avoids stale demo shadowing."""
+        from app.core.config import settings
+        if settings.DATA_MODE == "real":
+            real_latest = (
+                db.query(WaterReadingModel)
+                .filter(WaterReadingModel.operating_mode == "real")
+                .order_by(WaterReadingModel.timestamp.desc())
+                .first()
+            )
+            if real_latest is not None:
+                return real_latest
+        return db.query(WaterReadingModel).order_by(WaterReadingModel.timestamp.desc()).first()
 
     @classmethod
     def get_settings_response(cls, db: Session) -> WaterQualitySettingsResponse:
         config = cls.get_or_create_config(db)
         mode: WaterQualityModeLiteral = "drinking" if config.active_mode == "drinking" else "regular_usage"
-        latest = db.query(WaterReadingModel).order_by(WaterReadingModel.timestamp.desc()).first()
+        latest = cls.get_latest_preferred_reading(db)
         evaluation = cls.evaluate_reading(latest, config)
         return WaterQualitySettingsResponse(
             active_mode=mode,

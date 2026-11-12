@@ -22,40 +22,45 @@ export const OverallStatusBanner: React.FC<OverallStatusBannerProps> = ({
   const severity = evaluation?.alert_severity ?? reading?.alert_severity ?? 0;
   const violated = evaluation?.violated_parameters ?? [];
   const isStale = reading?.is_stale ?? false;
+  const wqs = evaluation?.wqs ?? null;
+  const waterStatusLabel = evaluation?.water_status_label ?? null;
+  const criticalHazard = evaluation?.critical_hazard ?? false;
+  const parseUtcDate = (ts: string) =>
+    new Date(/([zZ]|[+-]\d{2}:?\d{2})$/.test(ts) ? ts : `${ts}Z`);
   const lastSync = reading?.timestamp
-    ? new Date(reading.timestamp).toLocaleTimeString()
+    ? parseUtcDate(reading.timestamp).toLocaleTimeString()
     : 'Awaiting telemetry';
 
   let bannerBg = 'bg-emerald-50 border-emerald-200 text-emerald-900';
   let badgeBg = 'bg-emerald-100 text-emerald-800 border-emerald-300';
   let statusHeading = 'All Calibrated Parameters Within Limits';
-  let badgeLabel = 'ACCEPTABLE';
+  let badgeLabel = waterStatusLabel ? waterStatusLabel.toUpperCase() : 'ACCEPTABLE';
   let Icon = ShieldCheck;
 
-  if (overallStatus === 'CALIBRATION_PENDING') {
+  if (criticalHazard || overallStatus === 'CRITICAL' || severity === 2) {
+    bannerBg = 'bg-rose-50 border-rose-300 text-rose-950';
+    badgeBg = 'bg-rose-100 text-rose-800 border-rose-300';
+    statusHeading = criticalHazard ? 'CRITICAL HAZARD OVERRIDE ACTIVE' : 'Critical Threshold Violation';
+    badgeLabel = criticalHazard ? 'HAZARD' : 'CRITICAL';
+    Icon = ShieldAlert;
+  } else if (overallStatus === 'CALIBRATION_PENDING') {
     bannerBg = 'bg-amber-50/70 border-amber-200 text-amber-950';
     badgeBg = 'bg-amber-100 text-amber-800 border-amber-300';
-    statusHeading = 'Calibration Pending — Raw Voltages Active';
+    statusHeading = 'Calibration Pending — Diagnostic Voltages Active';
     badgeLabel = 'CAL PENDING';
     Icon = Wrench;
   } else if (overallStatus === 'WARNING') {
     bannerBg = 'bg-amber-50 border-amber-200 text-amber-950';
     badgeBg = 'bg-amber-100 text-amber-800 border-amber-300';
     statusHeading = 'Approaching Mode Threshold Limits';
-    badgeLabel = 'WARNING';
+    badgeLabel = waterStatusLabel ? waterStatusLabel.toUpperCase() : 'WARNING';
     Icon = AlertTriangle;
   } else if (overallStatus === 'EXCEEDED' || severity === 1) {
     bannerBg = 'bg-amber-50 border-amber-300 text-amber-950';
     badgeBg = 'bg-amber-200 text-amber-900 border-amber-400';
     statusHeading = 'Threshold Exceeded';
-    badgeLabel = 'ALERT';
+    badgeLabel = waterStatusLabel ? waterStatusLabel.toUpperCase() : 'ALERT';
     Icon = AlertTriangle;
-  } else if (overallStatus === 'CRITICAL' || severity === 2) {
-    bannerBg = 'bg-rose-50 border-rose-300 text-rose-950';
-    badgeBg = 'bg-rose-100 text-rose-800 border-rose-300';
-    statusHeading = 'Critical Threshold Violation';
-    badgeLabel = 'CRITICAL';
-    Icon = ShieldAlert;
   } else if (overallStatus === 'SENSOR_FAULT' || severity >= 3) {
     bannerBg = 'bg-purple-50 border-purple-200 text-purple-950';
     badgeBg = 'bg-purple-100 text-purple-800 border-purple-300';
@@ -105,13 +110,16 @@ export const OverallStatusBanner: React.FC<OverallStatusBannerProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center space-x-2 text-xs shrink-0">
+          <div className="flex flex-wrap items-center gap-2 text-xs shrink-0">
+            <div className="bg-white/90 px-2.5 py-1.5 rounded-lg border border-slate-200/80 font-mono text-slate-800 font-semibold">
+              WQS: {wqs !== null ? `${wqs.toFixed(1)}/100` : 'Unavailable'}
+            </div>
             <div className="flex items-center space-x-1.5 bg-white/80 px-2.5 py-1.5 rounded-lg border border-slate-200/70 font-mono text-slate-700">
               <Clock className="h-3.5 w-3.5 text-slate-400" />
               <span>{lastSync}</span>
             </div>
             <span className="bg-white/80 px-2.5 py-1.5 rounded-lg border border-slate-200/70 font-mono text-slate-700 uppercase">
-              {reading?.data_source || 'SIMULATED'}
+              {reading?.data_source || 'THINGSPEAK'}
             </span>
           </div>
         </div>

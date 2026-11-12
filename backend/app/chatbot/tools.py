@@ -17,11 +17,7 @@ class WaterChatbotTools:
     @staticmethod
     def get_current_water_status(db: Session) -> Dict[str, Any]:
         """Fetches latest reading alongside active Water Quality Mode evaluation & thresholds."""
-        latest = (
-            db.query(WaterReadingModel)
-            .order_by(WaterReadingModel.timestamp.desc())
-            .first()
-        )
+        latest = ModeService.get_latest_preferred_reading(db)
         config = ModeService.get_or_create_config(db)
         profile = ModeService.build_profile(config, "drinking" if config.active_mode == "drinking" else "regular_usage")
         evaluation = ModeService.evaluate_reading(latest, config)
@@ -66,6 +62,11 @@ class WaterChatbotTools:
             "violated_parameters": evaluation.violated_parameters,
             "parameter_evaluations": {k: v.model_dump() for k, v in evaluation.parameter_evaluations.items()},
             "overall_evaluation_status": evaluation.overall_status,
+            "wqs": evaluation.wqs,
+            "water_status_code": evaluation.water_status_code,
+            "water_status_label": evaluation.water_status_label,
+            "critical_hazard": evaluation.critical_hazard,
+            "hazard_reasons": evaluation.hazard_reasons,
             "health_summary": latest.sensor_health_summary,
             "health_code": f"0x{latest.health_code:04X}",
             "is_valid": latest.is_valid,
@@ -165,7 +166,7 @@ class WaterChatbotTools:
                 "drinking_limit": "≤ 500 mg/L (ppm) (BIS IS 10500:2012 Acceptable Limit)",
                 "unit": "mg/L (ppm)",
                 "implications": (
-                    "Measures total dissolved inorganic salts via electrical conductivity on GPIO35 (direct 3.3V)."
+                    "Estimates total dissolved inorganic salts via electrical conductivity on GPIO35 (direct 3.3V, ~25°C nominal with no automatic temperature compensation)."
                 ),
             }
         return {"error": f"Unknown parameter '{parameter}'. Supported: pH, Turbidity, TDS."}

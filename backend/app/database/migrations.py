@@ -30,3 +30,14 @@ def run_safe_migrations(db_engine: Engine) -> None:
                 )
             )
             logger.info("[Migration] Added 'water_quality_mode' column to water_readings.")
+
+        additions = {
+            "ph_sensor_estimate": "FLOAT",
+            "ph_demo_estimate": "FLOAT",
+            "ph_display_source": "VARCHAR(32) NOT NULL DEFAULT 'SENSOR_ESTIMATE'",
+            "sample_profile": "VARCHAR(32) NOT NULL DEFAULT 'live'",
+        }
+        for column, ddl in additions.items():
+            if column not in existing_cols:
+                conn.execute(text(f"ALTER TABLE water_readings ADD COLUMN {column} {ddl}"))
+                logger.info(f"[Migration] Added '{column}' column to water_readings.")

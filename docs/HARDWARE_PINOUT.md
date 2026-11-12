@@ -12,7 +12,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **pH Sensor** | Green Signal Board (P pin) | P | **GPIO 34** | ADC1_CH6 | Analog In (0–2.0V) | 15kΩ (top) / 10kΩ (GND) | Input Only |
 | **Turbidity Sensor** | Red Signal Board (OUT pin) | OUT | **GPIO 32** | ADC1_CH4 | Analog In (0–2.0V) | 15kΩ (top) / 10kΩ (GND) | Analog In |
-| **TDS Sensor** | *Future Expansion (Uninstalled)* | Signal | **GPIO 35** | ADC1_CH7 | Analog In (Reserved) | Pending Arrival | Input Only |
+| **TDS Sensor** | TDS Meter V1.0 (`A`, `+`, `-`) | A (Analog Out) | **GPIO 35** | ADC1_CH7 | Analog In (0–3.0V safe) | **None (Direct 3.3V, 1.0×)** | Input Only |
 | **OLED Display** | SSD1306 128×64 I2C | SDA | **GPIO 21** | Wire I2C SDA | Digital (3.3V) | None (Internal/Module Pullup) | Bidirectional |
 | **OLED Display** | SSD1306 128×64 I2C | SCL | **GPIO 22** | Wire I2C SCL | Digital (3.3V) | None (Internal/Module Pullup) | Output |
 | **Buzzer** | Active/Passive Buzzer Module | S (Signal) | **GPIO 25** | DAC1 / GPIO | Digital (3.3V) | Direct driver / Transistor | Output |
@@ -39,6 +39,7 @@ A critical design requirement on the ESP32 is avoiding **ADC2** when Wi-Fi is ac
 ```
 
 - **GPIO 34 and GPIO 35** are input-only pins (no internal pull-up/pull-down resistors). This makes them electrically optimal for high-impedance analog sensor signals without parasitic resistor loading.
+  - **TDS Direct Wiring (`TDS Meter V1.0`)**: `A` → **GPIO 35**, `+` → **3V3**, `-` → **Common GND** (no voltage divider; firmware uses `TDS_VOLTAGE_MULTIPLIER = 1.00f` and factory-calibrated `analogReadMilliVolts()`). Keep GPIO35 input strictly below `3.05 V` (`3.3 V` absolute rail).
 - **GPIO 32** is also on ADC1, ensuring continuous, glitch-free analog sampling during Wi-Fi transmissions to ThingSpeak.
 - **GPIO 25** is a general-purpose output pin on RTC/DAC, completely safe for driving the buzzer transistor/driver.
 
@@ -48,7 +49,7 @@ A critical design requirement on the ESP32 is avoiding **ADC2** when Wi-Fi is ac
 
 | Rail | Voltage | Destination Modules | Current Budget (Estimated) |
 | :--- | :--- | :--- | :--- |
-| **3V3** | 3.3V DC (ESP32 LDO) | SSD1306 OLED, ESP32 Chip | ~20 mA (OLED) + ~150-240 mA (ESP32 Wi-Fi peak) |
+| **3V3** | 3.3V DC (ESP32 LDO) | SSD1306 OLED, **TDS Meter V1.0 (`+`)**, ESP32 Chip | ~20 mA (OLED) + ~3–6 mA (TDS) + ~150-240 mA (ESP32 Wi-Fi peak) |
 | **VIN / 5V** | 5.0V DC (USB Bus) | Green pH Board (U+), Red Turbidity Board (VCC) | ~30 mA (Turbidity IR LED) + ~10 mA (pH Op-Amp) |
 | **GND** | 0.0V Ground | All boards & voltage dividers | Common ground reference across all modules |
 

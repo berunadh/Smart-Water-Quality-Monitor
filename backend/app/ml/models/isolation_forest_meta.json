@@ -7,9 +7,13 @@
     "ph_voltage",
     "turbidity_voltage"
   ],
-  "trained_at": "2026-11-10T14:29:39.742798",
-  "sample_count": 200,
-  "contamination": 0.08,
+  "trained_at": "2026-11-11T15:34:17.253476",
+  "sample_count": 600,
+  "contamination": 0.05,
   "trained_on_synthetic_data": true,
-  "validation_note": "Trained on controlled baseline. Real-world validation pending live sensor telemetry."
+  "validation_note": "Trained on controlled baseline. Real-world validation pending live sensor telemetry.",
+  "evaluation_note": "Evaluated against controlled synthetic benchmark with 10 injected anomalies.",
+  "synthetic_test_samples": 100,
+  "injected_anomalies_count": 10,
+  "detected_anomalies_count": 14
 }

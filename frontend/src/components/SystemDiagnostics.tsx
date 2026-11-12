@@ -31,6 +31,10 @@ export const SystemDiagnostics: React.FC<SystemDiagnosticsProps> = ({
     { bit: '0x0020', label: 'TDS Hardware Connected', active: system?.tds_installed ?? true },
     { bit: '0x0040', label: 'Calibration Pending', active: system?.calibration_pending ?? false },
     { bit: '0x0100', label: 'TDS Circuit Healthy', active: system?.tds_sensor_healthy ?? true },
+    { bit: '0x0400', label: 'TDS Dry / Not Immersed', active: system?.tds_dry ?? false },
+    { bit: '0x0800', label: 'TDS Provisional 25°C Model', active: system?.tds_provisional ?? false },
+    { bit: '0x1000', label: 'pH Provisional Estimate', active: system?.ph_provisional ?? false },
+    { bit: '0x2000', label: 'Turb Provisional Estimate', active: system?.turb_provisional ?? false },
   ];
 
   const phBoardVolt = reading?.ph_voltage ?? reading?.ph_board_voltage ?? 0;

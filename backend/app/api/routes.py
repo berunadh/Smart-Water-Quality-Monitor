@@ -30,9 +30,12 @@ from app.schemas.mode import (
     ThresholdUpdateRequest,
 )
 from app.services.thingspeak_service import ThingSpeakService
+from app.services.validation_service import ValidationService
 from app.services.demo_service import DemoService
 from app.services.alert_service import AlertService
 from app.services.mode_service import ModeService
+from app.services.sample_profile_service import SampleProfileService
+from app.schemas.sample_profile import SampleProfileStateResponse, SampleProfileUpdateRequest
 from app.ml.anomaly_detector import RobustStatisticalDetector, IsolationForestDetector
 from app.ml.fault_detector import SensorFaultDetector
 from app.ml.trend_analyzer import TrendAnalyzer
@@ -55,13 +58,9 @@ def get_backend_health(db: Session = Depends(get_db)):
     Returns backend service health, operating mode (demo/real),
     cloud connectivity state, and last successful telemetry timestamp.
     """
-    latest = (
-        db.query(WaterReadingModel)
-        .order_by(WaterReadingModel.timestamp.desc())
-        .first()
-    )
+    latest = ModeService.get_latest_preferred_reading(db)
 
-    last_sync = latest.timestamp if latest else None
+    last_sync = ValidationService.to_naive_utc(latest.timestamp) if latest else None
     is_stale = False
     if last_sync:
         age_seconds = (datetime.utcnow() - last_sync).total_seconds()
@@ -93,16 +92,12 @@ def get_system_status(db: Session = Depends(get_db)):
     reporting sensor availability, electrical safety, and Wi-Fi state.
     """
     config = ModeService.get_or_create_config(db)
-    latest = (
-        db.query(WaterReadingModel)
-        .order_by(WaterReadingModel.timestamp.desc())
-        .first()
-    )
+    latest = ModeService.get_latest_preferred_reading(db)
 
     if not latest:
         if settings.DATA_MODE == "demo":
             DemoService.seed_demo_history(db, count=10)
-            latest = db.query(WaterReadingModel).order_by(WaterReadingModel.timestamp.desc()).first()
+            latest = ModeService.get_latest_preferred_reading(db)
 
     if not latest:
         return SystemHealthResponse(
@@ -123,11 +118,12 @@ def get_system_status(db: Session = Depends(get_db)):
             last_cloud_sync=None,
         )
 
-    is_stale = (datetime.utcnow() - latest.timestamp).total_seconds() > 300
+    ts_utc = ValidationService.to_naive_utc(latest.timestamp) or datetime.utcnow()
+    is_stale = (datetime.utcnow() - ts_utc).total_seconds() > 300
     return SystemHealthResponse.from_bitmask(
         code=latest.health_code,
         operating_mode=settings.DATA_MODE,
-        last_sync=latest.timestamp,
+        last_sync=ts_utc,
         is_stale=is_stale,
         water_quality_mode=config.active_mode,
     )
@@ -143,17 +139,39 @@ def get_latest_reading(db: Session = Depends(get_db)):
     Retrieves the most recent water reading with calibration status,
     voltages, sensor health, and data source provenance.
     """
-    latest = (
-        db.query(WaterReadingModel)
-        .order_by(WaterReadingModel.timestamp.desc())
-        .first()
-    )
+    latest = ModeService.get_latest_preferred_reading(db)
 
     if not latest and settings.DATA_MODE == "demo":
         DemoService.seed_demo_history(db, count=15)
-        latest = db.query(WaterReadingModel).order_by(WaterReadingModel.timestamp.desc()).first()
+        latest = ModeService.get_latest_preferred_reading(db)
 
     return latest
+
+
+@api_router.get("/sample-profile", response_model=SampleProfileStateResponse, tags=["Presentation Profiles"])
+def get_sample_profile(db: Session = Depends(get_db)):
+    """Returns the persisted presentation profile; this is not a sensor calibration control."""
+    return SampleProfileService.describe(SampleProfileService.get_or_create(db))
+
+
+@api_router.put("/sample-profile", response_model=SampleProfileStateResponse, tags=["Presentation Profiles"])
+def set_sample_profile(payload: SampleProfileUpdateRequest, db: Session = Depends(get_db)):
+    """Changes explicit demo state only. Live ESP32 telemetry is never silently replaced."""
+    if settings.DATA_MODE != "demo":
+        raise HTTPException(
+            status_code=409,
+            detail="Sample profiles are demo-only. Live ThingSpeak/ESP32 telemetry is intentionally not replaced.",
+        )
+    state = SampleProfileService.get_or_create(db)
+    state.selected_profile = payload.selected_profile
+    if payload.contaminated_demo_ph is not None:
+        state.contaminated_demo_ph = payload.contaminated_demo_ph
+    db.flush()
+    reading = SampleProfileService.make_reading(state)
+    db.add(reading)
+    db.commit()
+    db.refresh(state)
+    return SampleProfileService.describe(state)
 
 
 @api_router.get("/readings/history", response_model=List[SensorReadingResponse], tags=["Sensor Readings"])
@@ -168,6 +186,10 @@ def get_readings_history(
     Retrieves paginated historical water telemetry with optional time-range filtering.
     """
     query = db.query(WaterReadingModel)
+    if settings.DATA_MODE == "real":
+        has_real = db.query(WaterReadingModel.id).filter(WaterReadingModel.operating_mode == "real").first() is not None
+        if has_real:
+            query = query.filter(WaterReadingModel.operating_mode == "real")
 
     if hours:
         cutoff = datetime.utcnow() - timedelta(hours=hours)
@@ -197,11 +219,16 @@ def get_sensor_statistics(
 ):
     """Computes mean, min, and max summary metrics over the requested timeframe."""
     cutoff = datetime.utcnow() - timedelta(hours=hours)
-    total = (
-        db.query(func.count(WaterReadingModel.id))
-        .filter(WaterReadingModel.timestamp >= cutoff, WaterReadingModel.is_valid == True)
-        .scalar() or 0
+    base_stat_q = db.query(WaterReadingModel).filter(
+        WaterReadingModel.timestamp >= cutoff,
+        WaterReadingModel.is_valid == True,
     )
+    if settings.DATA_MODE == "real":
+        has_real = db.query(WaterReadingModel.id).filter(WaterReadingModel.operating_mode == "real").first() is not None
+        if has_real:
+            base_stat_q = base_stat_q.filter(WaterReadingModel.operating_mode == "real")
+
+    total = base_stat_q.count()
 
     if total == 0:
         return SensorStatsResponse(
@@ -211,20 +238,21 @@ def get_sensor_statistics(
             last_updated=datetime.utcnow(),
         )
 
-    stats = (
-        db.query(
-            func.avg(WaterReadingModel.ph),
-            func.min(WaterReadingModel.ph),
-            func.max(WaterReadingModel.ph),
-            func.avg(WaterReadingModel.turbidity),
-            func.max(WaterReadingModel.turbidity),
-            func.avg(WaterReadingModel.tds),
-        )
-        .filter(WaterReadingModel.timestamp >= cutoff, WaterReadingModel.is_valid == True)
-        .first()
-    )
+    agg_q = db.query(
+        func.avg(WaterReadingModel.ph),
+        func.min(WaterReadingModel.ph),
+        func.max(WaterReadingModel.ph),
+        func.avg(WaterReadingModel.turbidity),
+        func.max(WaterReadingModel.turbidity),
+        func.avg(WaterReadingModel.tds),
+    ).filter(WaterReadingModel.timestamp >= cutoff, WaterReadingModel.is_valid == True)
+    if settings.DATA_MODE == "real":
+        has_real = db.query(WaterReadingModel.id).filter(WaterReadingModel.operating_mode == "real").first() is not None
+        if has_real:
+            agg_q = agg_q.filter(WaterReadingModel.operating_mode == "real")
+    stats = agg_q.first()
 
-    latest = db.query(WaterReadingModel).order_by(WaterReadingModel.timestamp.desc()).first()
+    latest = ModeService.get_latest_preferred_reading(db)
 
     return SensorStatsResponse(
         count=total,
@@ -486,11 +514,7 @@ def get_calibration_status(db: Session = Depends(get_db)):
     Returns current calibration state of all probes, active raw voltages,
     required reference standards, and recent logged calibration events.
     """
-    latest = (
-        db.query(WaterReadingModel)
-        .order_by(WaterReadingModel.timestamp.desc())
-        .first()
-    )
+    latest = ModeService.get_latest_preferred_reading(db)
 
     records = (
         db.query(CalibrationRecordModel)
@@ -502,6 +526,9 @@ def get_calibration_status(db: Session = Depends(get_db)):
     ph_cal = latest.ph_calibrated if latest else False
     turb_cal = latest.turbidity_calibrated if latest else False
     tds_cal = latest.tds_calibrated if latest else False
+    ph_prov = bool(latest and ((latest.health_code & (1 << 12)) or (latest.ph is not None and not latest.ph_calibrated)))
+    turb_prov = bool(latest and ((latest.health_code & (1 << 13)) or (latest.turbidity is not None and not latest.turbidity_calibrated)))
+    tds_prov = bool(latest and ((latest.health_code & (1 << 11)) or (latest.tds is not None and not latest.tds_calibrated)))
     ph_v = latest.ph_voltage if latest else 0.0
     turb_v = latest.turbidity_voltage if latest else 0.0
     tds_v = latest.tds_voltage if latest else None
@@ -510,13 +537,20 @@ def get_calibration_status(db: Session = Depends(get_db)):
         ph_calibrated=ph_cal,
         turbidity_calibrated=turb_cal,
         tds_calibrated=tds_cal,
+        ph_provisional=ph_prov,
+        turbidity_provisional=turb_prov,
+        tds_provisional=tds_prov,
         calibration_pending=(not ph_cal or not turb_cal or not tds_cal),
         ph_voltage=ph_v,
         turbidity_voltage=turb_v,
         tds_voltage=tds_v,
-        ph_reference_standards=["pH 7.00 (Neutral Buffer)", "pH 4.01 (Acidic Buffer)"],
-        turbidity_reference_standards=["0.0 NTU (Distilled Baseline)", "100.0 NTU (Certified Standard)"],
-        tds_reference_standards=["342 mg/L (NaCl Reference)", "707 mg/L (1413 uS/cm KCl Standard)"],
+        ph_reference_standards=[
+            "pH 4.01 (Acidic Buffer)",
+            "pH 7.00 (Neutral Transition Buffer)",
+            "pH 9.18 (Alkaline Buffer)",
+        ],
+        turbidity_reference_standards=["Verified Clear Baseline (NTU)", "Verified Certified NTU Standard"],
+        tds_reference_standards=["Temp-Compensated Cubic Polynomial (25°C nom.) + Optional Correction Factor"],
         recent_records=[CalibrationRecordResponse.model_validate(r) for r in records],
     )
 

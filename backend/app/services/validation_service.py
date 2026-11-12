@@ -1,12 +1,21 @@
 """Data quality, electrical safety, and staleness validation service."""
 
 from typing import Tuple, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from app.core.config import settings
 
 
 class ValidationService:
     STALENESS_THRESHOLD_SECONDS = 300  # 5 minutes
+
+    @staticmethod
+    def to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+        """Normalizes aware or naive datetimes to naive UTC to avoid tz arithmetic TypeError."""
+        if dt is None:
+            return None
+        if dt.tzinfo is not None and dt.utcoffset() is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
     @staticmethod
     def validate_reading(
@@ -27,9 +36,10 @@ class ValidationService:
         notes = []
         is_stale = False
 
-        # 1. Staleness check
-        if timestamp:
-            age_seconds = (datetime.utcnow() - timestamp).total_seconds()
+        # 1. Staleness check (UTC-normalized)
+        ts_utc = ValidationService.to_naive_utc(timestamp)
+        if ts_utc:
+            age_seconds = (datetime.utcnow() - ts_utc).total_seconds()
             if age_seconds > ValidationService.STALENESS_THRESHOLD_SECONDS:
                 is_stale = True
                 notes.append(f"STALE: Reading is {int(age_seconds / 60)} minutes old")

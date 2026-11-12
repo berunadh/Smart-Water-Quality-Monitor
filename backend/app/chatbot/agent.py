@@ -24,7 +24,7 @@ Hardware Architecture:
 - Sensors:
   1. pH Probe (E201-C + Green Board) on GPIO34 with 15kΩ/10kΩ voltage divider (÷2.5 step-down).
   2. Turbidity Optical Probe (Red Board) on GPIO32 with 15kΩ/10kΩ voltage divider (÷2.5 step-down).
-  3. TDS Probe (3.3V Direct Module) on GPIO35 with NO voltage divider (V_ADC directly, 0–3.3V safe).
+  3. TDS Probe (3.3V Direct Module) on GPIO35 with NO voltage divider (V_ADC directly, 0–3.3V safe; assumes ~25°C nominal with NO temperature sensor or automatic temperature compensation).
 - Local Alerts: 128×64 SSD1306 OLED + Smart Buzzer on GPIO25 (sounds ONLY for calibrated threshold breaches).
 
 Water Quality Modes:
@@ -35,9 +35,9 @@ Mandatory Rules:
 1. Base all answers strictly on the telemetry, active mode, active thresholds, calibration state, trends, and alerts provided below. Never fabricate sensor numbers.
 2. Always evaluate against the CURRENTLY SELECTED MODE and explicitly reference its thresholds.
 3. Never treat missing, null, or uncalibrated readings as 0 or normal. Never confuse raw voltage (V) with calibrated pH, NTU, or ppm.
-4. If sensors are pending calibration, explain that raw voltages are healthy diagnostic inputs and guide user calibration without basing water safety conclusions on uncalibrated data.
+4. If sensors are uncalibrated or pending calibration, state clearly that raw voltages are diagnostic only and unknown/tap water CANNOT be evaluated against thresholds or claimed safe.
 5. If telemetry is stale (>5 minutes old), explicitly warn the user.
-6. NEVER claim water is completely safe to drink solely from pH, turbidity, and TDS; always note certified lab testing is needed for pathogens/heavy metals.
+6. NEVER claim unknown, tap, or monitored water is certified or completely safe to drink solely from pH, turbidity, TDS, or software-generated Water Quality Score (WQS); always note certified lab testing is needed for pathogens/heavy metals.
 7. Explain specifically WHICH parameter caused a warning/alert when violations occur, and recommend concise, actionable next steps.
 8. Distinguish DEMO/SIMULATED telemetry from REAL hardware streams.
 9. Track conversation history naturally to resolve follow-up questions.
@@ -155,6 +155,8 @@ class WaterChatbotAgent:
         ph_val = current_status.get("ph")
         turb_val = current_status.get("turbidity_ntu")
         tds_val = current_status.get("tds_ppm")
+        wqs_val = current_status.get("wqs")
+        wqs_str = f"{wqs_val:.1f}/100" if wqs_val is not None else "Unavailable (requires all 3 valid sensors)"
 
         lines = [
             f"=== ACTIVE WATER QUALITY MODE & THRESHOLDS ===",
@@ -165,11 +167,11 @@ class WaterChatbotAgent:
             f"- Maximum TDS Limit: {th.get('tds_max', 500.0)} mg/L (ppm)",
             "",
             f"=== CURRENT SYSTEM TELEMETRY [{mode_str}] ===",
-            f"- Overall Status: {current_status.get('overall_evaluation_status', 'UNKNOWN')} | Severity: {current_status.get('alert_severity', 0)}",
+            f"- Overall Status: {current_status.get('overall_evaluation_status', 'UNKNOWN')} | Water Status: {current_status.get('water_status_code', -1)} ({current_status.get('water_status_label', 'Fault')}) | WQS: {wqs_str} | Severity: {current_status.get('alert_severity', 0)}",
             f"- Reading Timestamp: {current_status.get('timestamp', 'N/A')} (Stale >5m: {'YES - ' + str(current_status.get('age_minutes')) + 'm old' if current_status.get('is_stale') else 'NO'})",
             f"- Calibrated pH: {f'{ph_val:.2f}' if ph_val is not None else 'NULL / Calibration Pending'} | Calibrated: {current_status.get('ph_calibrated')} | Status: {param_evals.get('ph', {}).get('status', 'unknown')} | Board Voltage: {current_status.get('ph_voltage', 'N/A')} V (÷2.5 divider)",
             f"- Calibrated Turbidity: {f'{turb_val:.2f} NTU' if turb_val is not None else 'NULL / Calibration Pending'} | Calibrated: {current_status.get('turbidity_calibrated')} | Status: {param_evals.get('turbidity', {}).get('status', 'unknown')} | Board Voltage: {current_status.get('turbidity_voltage', 'N/A')} V (÷2.5 divider)",
-            f"- Calibrated TDS: {f'{tds_val:.0f} mg/L' if tds_val is not None else 'NULL / Calibration Pending'} | Calibrated: {current_status.get('tds_calibrated')} | Status: {param_evals.get('tds', {}).get('status', 'unknown')} | ADC Voltage: {tds_v_str}",
+            f"- Calibrated TDS: {f'{tds_val:.0f} mg/L' if tds_val is not None else 'NULL / Calibration Pending'} | Calibrated: {current_status.get('tds_calibrated')} | Status: {param_evals.get('tds', {}).get('status', 'unknown')} | ADC Voltage: {tds_v_str} | Temp Comp: None (~25°C nominal)",
             f"- Violated Parameters Under Active Mode: {', '.join(violated) if violated else 'None'}",
             f"- Hardware Health Summary: {current_status.get('health_summary', 'OPERATIONAL')} ({current_status.get('health_code', '0x0000')}) | Electrical Safe: {current_status.get('is_valid', True)}",
             "",
@@ -343,10 +345,21 @@ class WaterChatbotAgent:
             )
 
         if "safe" in q or "drink" in q or "potable" in q:
+            uncal_list = []
+            if ph is None:
+                uncal_list.append("pH")
+            if turb is None:
+                uncal_list.append("Turbidity")
+            if tds is None:
+                uncal_list.append("TDS")
+            uncal_note = (
+                f"\n- **Uncalibrated Sensors ({', '.join(uncal_list)}):** Raw voltages are diagnostic only; unknown or tap water cannot be evaluated against thresholds until calibrated with certified reference standards."
+                if uncal_list else ""
+            )
             issue_str = f" Currently flagging: **{'; '.join(violated)}**." if violated else ""
             return (
                 f"**Preliminary Assessment [{mode_label}]:**\n"
-                f"Even if pH, turbidity, and TDS meet BIS IS 10500:2012 acceptable limits, **normal sensor readings DO NOT prove or certify water as safe to drink**.{issue_str}\n\n"
+                f"Even if pH, turbidity, and TDS meet BIS IS 10500:2012 acceptable limits, **normal sensor readings DO NOT prove or certify water as safe to drink**.{issue_str}{uncal_note}\n\n"
                 "- Physical probes cannot detect microbiological pathogens (*E. coli*, bacteria, viruses) or dissolved heavy metals.\n"
                 f"- Laboratory bacteriological and chemical testing is required to confirm potability.{stale_note}"
             )
@@ -363,8 +376,8 @@ class WaterChatbotAgent:
                 return "**Electrical / Hardware Fault Active:** Check probe connections and voltage divider outputs before trusting readings."
             if status.get("overall_evaluation_status") == "CALIBRATION_PENDING":
                 return (
-                    "**Calibration Pending:** At least one probe is uncalibrated (reporting raw ADC/board voltages only). "
-                    "Complete calibration via Serial Monitor (`ph cal 7.00`/`4.01`, `turb cal clear`/`<ntu>`, `tds cal <ppm>`) before evaluating water safety."
+                    "**Calibration Pending:** At least one probe does not yet have verified calibration constants stored in NVS (reporting diagnostic voltages only). "
+                    "Supply the verified calibration constants in firmware `config.h` before evaluating water safety."
                 )
             if alerts and not alerts[0].get("resolved"):
                 return f"**Recent Incident:** {alerts[0].get('title')} — {alerts[0].get('message')}.{stale_note}"
@@ -373,27 +386,31 @@ class WaterChatbotAgent:
         if "tds" in q:
             if tds is not None:
                 return (
-                    f"**TDS Reading:** {tds:.0f} mg/L (Direct ADC: {f'{tds_v:.3f} V' if tds_v is not None else 'N/A'}). "
+                    f"**TDS Reading:** {tds:.0f} mg/L (Direct ADC: {f'{tds_v:.3f} V' if tds_v is not None else 'N/A'}; uncompensated, assumes ~25°C nominal). "
                     f"Active {mode_label} limit: ≤ {th.get('tds_max', 500):.0f} mg/L.{stale_note}"
                 )
             return (
                 f"**TDS Status:** Calibration Pending (`null`, never 0 ppm). "
                 f"GPIO35 ADC Voltage: {f'{tds_v:.3f} V (direct 3.3V, no divider)' if tds_v is not None else 'Awaiting reading'}. "
-                "Calibrate using a certified standard (`tds cal <ppm>` then `tds confirm`)."
+                "Uses the 25°C nominal temperature-compensated cubic polynomial (no physical temp sensor; optional verified kFactor persisted in NVS)."
             )
 
         if "ph" in q:
             if ph is not None:
                 return f"**pH Reading:** {ph:.2f} (Board Voltage: {ph_v:.3f} V ÷2.5 divider). Active {mode_label} range: {th.get('ph_min')}–{th.get('ph_max')}.{stale_note}"
-            return f"**pH Status:** Calibration Pending (`null`). Board Voltage: {ph_v:.3f} V. Perform two-point buffer calibration (`pH 7.00` & `pH 4.01`)."
+            return f"**pH Status:** Calibration Pending (`null`). Board Voltage: {ph_v:.3f} V. Requires verified 3-point buffer constants (pH 4.01, 7.00, 9.18)."
 
         if "turbid" in q:
             if turb is not None:
                 return f"**Turbidity Reading:** {turb:.2f} NTU (Board Voltage: {turb_v:.3f} V ÷2.5 divider). Active {mode_label} limit: ≤ {th.get('turbidity_max')} NTU.{stale_note}"
-            return f"**Turbidity Status:** Calibration Pending (`null`). Board Voltage: {turb_v:.3f} V. Calibrate using 0 NTU distilled water and a known NTU standard."
+            return f"**Turbidity Status:** Calibration Pending (`null`). Board Voltage: {turb_v:.3f} V. Requires verified voltage-to-NTU calibration parameters in firmware/NVS."
+
+        wqs_val = status.get("wqs")
+        wqs_str = f"{wqs_val:.1f}/100 ({status.get('water_status_label', 'Fault')})" if wqs_val is not None else f"Unavailable ({status.get('water_status_label', 'Fault')})"
 
         return (
             f"**HydroSense Summary [{mode_label} • {'DEMO' if settings.DATA_MODE == 'demo' else 'LIVE'}]:**\n"
+            f"- Water Quality Score (WQS): {wqs_str} *(preliminary screening only; not certified potability)*\n"
             f"- pH: {f'{ph:.2f}' if ph is not None else 'Calibration Pending'} (Limit: {th.get('ph_min')}–{th.get('ph_max')})\n"
             f"- Turbidity: {f'{turb:.2f} NTU' if turb is not None else 'Calibration Pending'} (Limit: ≤ {th.get('turbidity_max')} NTU)\n"
             f"- TDS: {f'{tds:.0f} mg/L' if tds is not None else 'Calibration Pending'} (Limit: ≤ {th.get('tds_max', 500):.0f} mg/L)\n"

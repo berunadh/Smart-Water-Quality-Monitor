@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
 
-    # Operating Mode: "demo" (simulated realistic streams) or "real" (ThingSpeak cloud)
-    DATA_MODE: str = "demo"
+    # Operating Mode: "real" (ThingSpeak cloud) or "demo" (simulated streams)
+    DATA_MODE: str = "real"
     DEVICE_ID: str = "esp32-water-monitor-01"
 
     # Database
@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # ThingSpeak Cloud Telemetry Settings
     THINGSPEAK_CHANNEL_ID: str = "0"
     THINGSPEAK_READ_API_KEY: Optional[str] = None
+    THINGSPEAK_FIELD_PROFILE: str = "8field"  # "8field" (Channel 3570138) or "5field" (Documented optional)
     POLL_INTERVAL_SECONDS: int = 20
 
     # Sensor Guidelines (EPA / WHO Standards)
